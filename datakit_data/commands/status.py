@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from cliff.command import Command
 from datakit import CommandHelpers
 from datakit.utils import read_json, write_json
@@ -77,11 +77,11 @@ class Status(ProjectMixin, CommandHelpers, Command):
         newer_local = []
         newer_s3 = []
         for rel_path in local_keys & s3_keys:
-            local_dt = datetime.fromtimestamp(os.path.getmtime(local_files[rel_path]), tz=timezone.utc)
-            s3_dt = s3._last_modified(s3_objects[rel_path])
-            if local_dt > s3_dt:
+            should_upload, _ = s3._should_upload(local_files[rel_path], s3_objects[rel_path])
+            should_download, _ = s3._should_download(local_files[rel_path], s3_objects[rel_path])
+            if should_upload:
                 newer_local.append(rel_path)
-            elif s3_dt > local_dt:
+            if should_download:
                 newer_s3.append(rel_path)
         self._log_group("file(s) local but not on S3", only_local, filepaths)
         self._log_group("file(s) on S3 but not local", only_s3, filepaths)

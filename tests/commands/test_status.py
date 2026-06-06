@@ -257,11 +257,21 @@ def test_filepaths_nested_path(caplog, fake_project):
 # --all: live S3 comparison
 # ---------------------------------------------------------------------------
 
-def _make_s3_objects(paths, base_dt=None):
-    """Return a dict of {rel_path: LastModified} for use as a mock S3 listing."""
+def _s3_object(size=0, last_modified=None):
+    if last_modified is None:
+        last_modified = datetime.now(tz=timezone.utc)
+    return {
+        'Size': size,
+        'LastModified': last_modified,
+        'ETag': '"fake-etag"',
+    }
+
+
+def _make_s3_objects(paths, base_dt=None, size=0):
+    """Return a dict of {rel_path: object metadata} for use as a mock S3 listing."""
     if base_dt is None:
         base_dt = datetime.now(tz=timezone.utc)
-    return {p: base_dt for p in paths}
+    return {p: _s3_object(size=size, last_modified=base_dt) for p in paths}
 
 
 def _run_status_all(mocker, local_files, s3_objects, filepaths=False):
@@ -306,7 +316,7 @@ def test_all_newer_locally(caplog, mocker, fake_project):
     _make_file(data_file)
     s3_dt = datetime.now(tz=timezone.utc) - timedelta(hours=1)
     local = {'foo.csv': data_file}
-    s3_objs = {'foo.csv': s3_dt}
+    s3_objs = {'foo.csv': _s3_object(size=os.path.getsize(data_file), last_modified=s3_dt)}
     _run_status_all(mocker, local, s3_objs)
     assert '0 file(s) local but not on S3' in caplog.text
     assert '1 file(s) newer locally than on S3' in caplog.text
@@ -318,7 +328,7 @@ def test_all_newer_on_s3(caplog, mocker, fake_project):
     _make_file(data_file, mtime=time.time() - 3600)
     s3_dt = datetime.now(tz=timezone.utc)
     local = {'foo.csv': data_file}
-    s3_objs = {'foo.csv': s3_dt}
+    s3_objs = {'foo.csv': _s3_object(size=os.path.getsize(data_file), last_modified=s3_dt)}
     _run_status_all(mocker, local, s3_objs)
     assert '0 file(s) local but not on S3' in caplog.text
     assert '0 file(s) newer locally than on S3' in caplog.text
@@ -332,7 +342,10 @@ def test_all_mixed(caplog, mocker, fake_project):
     _make_file(shared, mtime=time.time() - 3600)
     s3_dt = datetime.now(tz=timezone.utc)
     local = {'new.csv': local_only, 'shared.csv': shared}
-    s3_objs = {'shared.csv': s3_dt, 'remote_only.csv': s3_dt - timedelta(hours=2)}
+    s3_objs = {
+        'shared.csv': _s3_object(size=os.path.getsize(shared), last_modified=s3_dt),
+        'remote_only.csv': _s3_object(last_modified=s3_dt - timedelta(hours=2)),
+    }
     _run_status_all(mocker, local, s3_objs)
     assert '1 file(s) local but not on S3' in caplog.text
     assert '1 file(s) on S3 but not local' in caplog.text
@@ -371,7 +384,12 @@ def test_all_filepaths_newer_locally(caplog, mocker, fake_project):
     data_file = os.path.join(fake_project, 'data', 'foo.csv')
     _make_file(data_file)
     s3_dt = datetime.now(tz=timezone.utc) - timedelta(hours=1)
-    _run_status_all(mocker, {'foo.csv': data_file}, {'foo.csv': s3_dt}, filepaths=True)
+    _run_status_all(
+        mocker,
+        {'foo.csv': data_file},
+        {'foo.csv': _s3_object(size=os.path.getsize(data_file), last_modified=s3_dt)},
+        filepaths=True,
+    )
     assert '1 file(s) newer locally than on S3' in caplog.text
     assert '  foo.csv' in caplog.text
 
@@ -380,9 +398,54 @@ def test_all_filepaths_newer_on_s3(caplog, mocker, fake_project):
     data_file = os.path.join(fake_project, 'data', 'foo.csv')
     _make_file(data_file, mtime=time.time() - 3600)
     s3_dt = datetime.now(tz=timezone.utc)
-    _run_status_all(mocker, {'foo.csv': data_file}, {'foo.csv': s3_dt}, filepaths=True)
+    _run_status_all(
+        mocker,
+        {'foo.csv': data_file},
+        {'foo.csv': _s3_object(size=os.path.getsize(data_file), last_modified=s3_dt)},
+        filepaths=True,
+    )
     assert '1 file(s) newer on S3 than locally' in caplog.text
     assert '  foo.csv' in caplog.text
+
+
+def test_all_size_difference_counts_for_both_directions(caplog, mocker, fake_project):
+    data_file = os.path.join(fake_project, 'data', 'foo.csv')
+    local_mtime = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    _make_file(data_file, mtime=local_mtime)
+    with open(data_file, 'w') as f:
+        f.write('abc')
+    os.utime(data_file, (local_mtime, local_mtime))
+    s3_dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    _run_status_all(
+        mocker,
+        {'foo.csv': data_file},
+        {'foo.csv': _s3_object(size=4, last_modified=s3_dt)},
+    )
+
+    assert '0 file(s) local but not on S3' in caplog.text
+    assert '0 file(s) on S3 but not local' in caplog.text
+    assert '1 file(s) newer locally than on S3' in caplog.text
+    assert '1 file(s) newer on S3 than locally' in caplog.text
+
+
+def test_all_filepaths_size_difference_lists_path_in_both_groups(caplog, mocker, fake_project):
+    data_file = os.path.join(fake_project, 'data', 'foo.csv')
+    local_mtime = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    _make_file(data_file, mtime=local_mtime)
+    with open(data_file, 'w') as f:
+        f.write('abc')
+    os.utime(data_file, (local_mtime, local_mtime))
+    s3_dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    _run_status_all(
+        mocker,
+        {'foo.csv': data_file},
+        {'foo.csv': _s3_object(size=4, last_modified=s3_dt)},
+        filepaths=True,
+    )
+
+    assert '1 file(s) newer locally than on S3' in caplog.text
+    assert '1 file(s) newer on S3 than locally' in caplog.text
+    assert caplog.text.count('  foo.csv') == 2
 
 
 def test_all_no_bucket(caplog, fake_project):
