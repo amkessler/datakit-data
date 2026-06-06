@@ -71,11 +71,15 @@ class S3:
             return 1
         client = self._client()
         failures = 0
-        remote_keys = self._list_s3_keys(client, prefix)
-        for key in remote_keys:
-            rel_path = key[len(prefix):]
+        local_files = self._list_local_files(data_dir)
+        remote_objects = self._list_s3_objects(client, prefix)
+        for rel_path, remote_obj in sorted(remote_objects.items()):
             local_path = os.path.join(data_dir, rel_path)
-            logger.info(f"download: s3://{self.bucket}/{key} to {local_path}")
+            should_download, reason = self._should_download(local_path, remote_obj)
+            if not should_download:
+                continue
+            key = prefix + rel_path
+            logger.info(f"download: s3://{self.bucket}/{key} to {local_path} ({reason})")
             if not dryrun:
                 os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
                 try:
@@ -84,8 +88,7 @@ class S3:
                     failures += 1
                     logger.info(f"\n*** Error ***\n{e}\n")
         if delete:
-            local_files = self._list_local_files(data_dir)
-            remote_rel = {k[len(prefix):] for k in remote_keys}
+            remote_rel = set(remote_objects)
             for rel_path, local_path in sorted(local_files.items()):
                 if rel_path not in remote_rel:
                     logger.info(f"delete: {local_path}")
@@ -155,6 +158,21 @@ class S3:
             return True, 'local file is newer'
 
         return False, 'remote object is current'
+
+    def _should_download(self, local_path, remote_obj):
+        if not os.path.exists(local_path):
+            return True, 'missing locally'
+
+        local_size = os.path.getsize(local_path)
+        if local_size != remote_obj['Size']:
+            return True, 'size differs'
+
+        local_mtime = datetime.fromtimestamp(os.path.getmtime(local_path), tz=timezone.utc)
+        remote_mtime = self._last_modified(remote_obj)
+        if remote_mtime > local_mtime:
+            return True, 'remote object is newer'
+
+        return False, 'local file is current'
 
     def _last_modified(self, remote_obj):
         if isinstance(remote_obj, dict):

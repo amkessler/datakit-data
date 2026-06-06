@@ -47,11 +47,12 @@ def test_push(mocker):
 
 def test_pull(mocker):
     """
-    S3.pull downloads each S3 key to the correct local path.
+    S3.pull downloads each S3 object that is missing locally to the correct local path.
     """
-    mocker.patch.object(S3, '_list_s3_keys', return_value=[
-        '2017/fake-project/foo', '2017/fake-project/bar'
-    ])
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo': _remote_object(),
+        'bar': _remote_object(),
+    })
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mocker.patch('datakit_data.s3.os.makedirs')
@@ -205,13 +206,95 @@ def test_pull_dryrun(mocker):
     """
     S3.pull with --dryrun logs intended downloads without calling download_file.
     """
-    mocker.patch.object(S3, '_list_s3_keys', return_value=['2017/fake-project/foo'])
+    mocker.patch.object(S3, '_list_s3_objects', return_value={'foo': _remote_object()})
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
 
     s3 = S3('ap', 'foo.org')
     s3.pull('data/', '2017/fake-project', extra_flags=['--dryrun'])
 
+    mock_client.download_file.assert_not_called()
+
+
+def test_pull_skips_current_local_file(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    local_mtime = datetime(2024, 1, 15, 12, 5, 0, tzinfo=timezone.utc).timestamp()
+    _make_file(local_path, content='abc', mtime=local_mtime)
+    remote_mtime = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo.csv': _remote_object(size=3, last_modified=remote_mtime)
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project')
+
+    assert result == 0
+    mock_client.download_file.assert_not_called()
+
+
+def test_pull_downloads_when_remote_object_is_newer(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    local_mtime = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    _make_file(local_path, content='abc', mtime=local_mtime)
+    remote_mtime = datetime(2024, 1, 15, 12, 5, 0, tzinfo=timezone.utc)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo.csv': _remote_object(size=3, last_modified=remote_mtime)
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project')
+
+    assert result == 0
+    mock_client.download_file.assert_called_once_with(
+        'foo.org',
+        '2017/fake-project/foo.csv',
+        local_path,
+    )
+
+
+def test_pull_downloads_when_size_differs(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    _make_file(local_path, content='abc')
+    remote_mtime = datetime.now(tz=timezone.utc) - timedelta(hours=1)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo.csv': _remote_object(size=4, last_modified=remote_mtime)
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project')
+
+    assert result == 0
+    mock_client.download_file.assert_called_once_with(
+        'foo.org',
+        '2017/fake-project/foo.csv',
+        local_path,
+    )
+
+
+def test_pull_skips_when_local_file_is_newer(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    _make_file(local_path, content='abc')
+    remote_mtime = datetime.now(tz=timezone.utc) - timedelta(hours=1)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo.csv': _remote_object(size=3, last_modified=remote_mtime)
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project')
+
+    assert result == 0
     mock_client.download_file.assert_not_called()
 
 
@@ -242,7 +325,8 @@ def test_pull_delete(mocker):
     """
     S3.pull with --delete removes local files that are absent from S3.
     """
-    mocker.patch.object(S3, '_list_s3_keys', return_value=['2017/fake-project/foo'])
+    mocker.patch.object(S3, '_list_s3_objects', return_value={'foo': _remote_object()})
+    mocker.patch.object(S3, '_should_download', return_value=(False, 'local file is current'))
     mocker.patch.object(S3, '_list_local_files', return_value={
         'foo': 'data/foo',
         'stale': 'data/stale',
@@ -397,7 +481,7 @@ def test_pull_delete_empty_path_refused(caplog, mocker):
     S3.pull refuses --delete when s3_path normalizes to an empty prefix (whole-bucket scope),
     aborting before any S3 client is created or keys are listed.
     """
-    list_keys = mocker.patch.object(S3, '_list_s3_keys')
+    list_objects = mocker.patch.object(S3, '_list_s3_objects')
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
 
     s3 = S3('ap', 'foo.org')
@@ -406,14 +490,14 @@ def test_pull_delete_empty_path_refused(caplog, mocker):
     assert result == 1
     assert 'Refusing --delete' in caplog.text
     mock_session.assert_not_called()
-    list_keys.assert_not_called()
+    list_objects.assert_not_called()
 
 
 def test_pull_client_error(caplog, mocker):
     """
     S3.pull logs an error message when boto3 raises a ClientError.
     """
-    mocker.patch.object(S3, '_list_s3_keys', return_value=['2017/fake-project/foo'])
+    mocker.patch.object(S3, '_list_s3_objects', return_value={'foo': _remote_object()})
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.download_file.side_effect = ClientError(
@@ -449,9 +533,10 @@ def test_pull_logging(caplog, mocker):
     """
     S3.pull logs a 'download:' line for each file transferred.
     """
-    mocker.patch.object(S3, '_list_s3_keys', return_value=[
-        '2017/fake-project/foo', '2017/fake-project/bar'
-    ])
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo': _remote_object(),
+        'bar': _remote_object(),
+    })
     mocker.patch('datakit_data.s3.boto3.Session')
     mocker.patch('datakit_data.s3.os.makedirs')
 
