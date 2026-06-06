@@ -298,6 +298,21 @@ def test_pull_skips_when_local_file_is_newer(mocker, tmpdir):
     mock_client.download_file.assert_not_called()
 
 
+def test_pull_ignores_s3_directory_markers(mocker):
+    """
+    S3.pull ignores zero-byte S3 directory marker objects that end in '/'.
+    """
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull('data/', '2017/fake-project')
+
+    assert result == 0
+    mock_client.download_file.assert_not_called()
+
+
 def test_push_delete(mocker):
     """
     S3.push with --delete batch-removes S3 keys that have no corresponding local file.
@@ -683,6 +698,26 @@ def test_list_s3_objects(mocker):
     assert result == {
         'foo': {'Size': 10, 'LastModified': last_modified, 'ETag': '"foo"'},
         'bar': {'Size': 20, 'LastModified': last_modified, 'ETag': '"bar"'},
+    }
+
+
+def test_list_s3_objects_ignores_directory_markers(mocker):
+    from datetime import datetime, timezone
+    last_modified = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_paginator = mock_client.get_paginator.return_value
+    mock_paginator.paginate.return_value = [{'Contents': [
+        {'Key': '2017/source/', 'Size': 0, 'LastModified': last_modified, 'ETag': '"dir"'},
+        {'Key': '2017/source/foo.csv', 'Size': 10, 'LastModified': last_modified, 'ETag': '"foo"'},
+    ]}]
+
+    s3 = S3('ap', 'foo.org')
+    client = s3._client()
+    result = s3._list_s3_objects(client, '2017/')
+
+    assert result == {
+        'source/foo.csv': {'Size': 10, 'LastModified': last_modified, 'ETag': '"foo"'},
     }
 
 

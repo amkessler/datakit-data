@@ -197,7 +197,7 @@ class S3:
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get('Contents', []):
                 rel_path = obj['Key'][len(prefix):]
-                if rel_path:
+                if rel_path and not rel_path.endswith('/'):
                     objects[rel_path] = {
                         'Size': obj['Size'],
                         'LastModified': obj['LastModified'],
