@@ -78,9 +78,10 @@ class Status(ProjectMixin, CommandHelpers, Command):
         newer_s3 = []
         for rel_path in local_keys & s3_keys:
             local_dt = datetime.fromtimestamp(os.path.getmtime(local_files[rel_path]), tz=timezone.utc)
-            if local_dt > s3_objects[rel_path]:
+            s3_dt = s3._last_modified(s3_objects[rel_path])
+            if local_dt > s3_dt:
                 newer_local.append(rel_path)
-            elif s3_objects[rel_path] > local_dt:
+            elif s3_dt > local_dt:
                 newer_s3.append(rel_path)
         self._log_group("file(s) local but not on S3", only_local, filepaths)
         self._log_group("file(s) on S3 but not local", only_s3, filepaths)

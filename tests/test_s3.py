@@ -1,17 +1,37 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 from botocore.exceptions import ClientError, EndpointConnectionError
 
 from datakit_data.s3 import S3
 
 
+def _remote_object(size=0, last_modified=None):
+    if last_modified is None:
+        last_modified = datetime.now(tz=timezone.utc)
+    return {
+        'Size': size,
+        'LastModified': last_modified,
+        'ETag': '"fake-etag"',
+    }
+
+
+def _make_file(path, content='', mtime=None):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(content)
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+
+
 def test_push(mocker):
     """
-    S3.push uploads each local file to the correct S3 key.
+    S3.push uploads each local file that is missing from S3 to the correct S3 key.
     """
     mocker.patch.object(S3, '_list_local_files', return_value={
         'foo': 'data/foo', 'bar': 'data/bar'
     })
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
 
@@ -50,6 +70,7 @@ def test_push_creates_sync_markers(mocker, tmpdir):
     data_dir = str(tmpdir.mkdir('data'))
     sync_dir = str(tmpdir.mkdir('sync'))
     open(os.path.join(data_dir, 'foo.csv'), 'w').close()
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mocker.patch('datakit_data.s3.boto3.Session')
 
     s3 = S3('ap', 'foo.org')
@@ -67,6 +88,7 @@ def test_push_skips_synced_files(mocker):
         'foo.synced': 'data/foo.synced',
         'subdir/bar.synced': 'data/subdir/bar.synced',
     })
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
 
@@ -83,6 +105,7 @@ def test_push_dryrun(mocker):
     S3.push with --dryrun logs intended uploads without calling upload_file.
     """
     mocker.patch.object(S3, '_list_local_files', return_value={'foo': 'data/foo'})
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
 
@@ -90,6 +113,92 @@ def test_push_dryrun(mocker):
     s3.push('data/', '2017/fake-project', extra_flags=['--dryrun'])
 
     mock_client.upload_file.assert_not_called()
+
+
+def test_push_skips_current_remote_file_and_refreshes_marker(mocker, tmpdir):
+    """
+    S3.push skips upload when size matches and S3 is as new as the local file,
+    but still creates a sync marker because the remote object is confirmed current.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    local_mtime = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    _make_file(local_path, content='abc', mtime=local_mtime)
+    remote_mtime = datetime(2024, 1, 15, 12, 5, 0, tzinfo=timezone.utc)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo.csv': _remote_object(size=3, last_modified=remote_mtime)
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
+
+    assert result == 0
+    mock_client.upload_file.assert_not_called()
+    assert os.path.exists(os.path.join(sync_dir, 'foo.csv.synced'))
+
+
+def test_push_uploads_when_local_file_is_newer(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    _make_file(local_path, content='abc')
+    remote_mtime = datetime.now(tz=timezone.utc) - timedelta(hours=1)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo.csv': _remote_object(size=3, last_modified=remote_mtime)
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project')
+
+    assert result == 0
+    mock_client.upload_file.assert_called_once_with(
+        local_path,
+        'foo.org',
+        '2017/fake-project/foo.csv',
+    )
+
+
+def test_push_uploads_when_size_differs(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    _make_file(local_path, content='abc')
+    remote_mtime = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo.csv': _remote_object(size=4, last_modified=remote_mtime)
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project')
+
+    assert result == 0
+    mock_client.upload_file.assert_called_once_with(
+        local_path,
+        'foo.org',
+        '2017/fake-project/foo.csv',
+    )
+
+
+def test_push_dryrun_does_not_create_sync_marker(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    _make_file(local_path, content='abc')
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', extra_flags=['--dryrun'], sync_status_dir=sync_dir)
+
+    assert result == 0
+    mock_client.upload_file.assert_not_called()
+    assert not os.path.exists(os.path.join(sync_dir, 'foo.csv.synced'))
 
 
 def test_pull_dryrun(mocker):
@@ -111,10 +220,9 @@ def test_push_delete(mocker):
     S3.push with --delete batch-removes S3 keys that have no corresponding local file.
     """
     mocker.patch.object(S3, '_list_local_files', return_value={'foo': 'data/foo'})
-    mocker.patch.object(S3, '_list_s3_keys', return_value=[
-        '2017/fake-project/foo',
-        '2017/fake-project/stale',
-    ])
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'stale': _remote_object(),
+    })
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.delete_objects.return_value = {'Deleted': [{'Key': '2017/fake-project/stale'}]}
@@ -154,6 +262,7 @@ def test_push_client_error(caplog, mocker):
     S3.push logs an error message and counts the failure when boto3 raises a ClientError.
     """
     mocker.patch.object(S3, '_list_local_files', return_value={'foo': 'data/foo'})
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.upload_file.side_effect = ClientError(
@@ -167,11 +276,32 @@ def test_push_client_error(caplog, mocker):
     assert '*** Error ***' in caplog.text
 
 
+def test_push_failed_upload_does_not_create_sync_marker(caplog, mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    _make_file(local_path, content='abc')
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_client.upload_file.side_effect = ClientError(
+        {'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}}, 'PutObject'
+    )
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
+
+    assert result == 1
+    assert '*** Error ***' in caplog.text
+    assert not os.path.exists(os.path.join(sync_dir, 'foo.csv.synced'))
+
+
 def test_push_connection_error(caplog, mocker):
     """
     S3.push also catches non-ClientError botocore errors (e.g. connection failures).
     """
     mocker.patch.object(S3, '_list_local_files', return_value={'foo': 'data/foo'})
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.upload_file.side_effect = EndpointConnectionError(endpoint_url='https://s3')
@@ -188,11 +318,10 @@ def test_push_delete_batch_error(caplog, mocker):
     S3.push counts every key in a batch as failed when delete_objects raises.
     """
     mocker.patch.object(S3, '_list_local_files', return_value={'foo': 'data/foo'})
-    mocker.patch.object(S3, '_list_s3_keys', return_value=[
-        '2017/fake-project/foo',
-        '2017/fake-project/stale1',
-        '2017/fake-project/stale2',
-    ])
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'stale1': _remote_object(),
+        'stale2': _remote_object(),
+    })
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.delete_objects.side_effect = ClientError(
@@ -211,11 +340,10 @@ def test_push_delete_partial_error(caplog, mocker):
     S3.push counts per-key Errors reported in the delete_objects response.
     """
     mocker.patch.object(S3, '_list_local_files', return_value={'foo': 'data/foo'})
-    mocker.patch.object(S3, '_list_s3_keys', return_value=[
-        '2017/fake-project/foo',
-        '2017/fake-project/stale1',
-        '2017/fake-project/stale2',
-    ])
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'stale1': _remote_object(),
+        'stale2': _remote_object(),
+    })
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.delete_objects.return_value = {
@@ -253,6 +381,7 @@ def test_push_empty_path_without_delete_allowed(mocker):
     without a leading slash.
     """
     mocker.patch.object(S3, '_list_local_files', return_value={'foo': 'data/foo'})
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
 
@@ -306,6 +435,7 @@ def test_push_logging(caplog, mocker):
     mocker.patch.object(S3, '_list_local_files', return_value={
         'foo': 'data/foo', 'bar': 'data/bar'
     })
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mocker.patch('datakit_data.s3.boto3.Session')
 
     s3 = S3('ap', 'foo.org')
@@ -434,8 +564,8 @@ def test_list_s3_objects(mocker):
     mock_client = mock_session.return_value.client.return_value
     mock_paginator = mock_client.get_paginator.return_value
     mock_paginator.paginate.return_value = [{'Contents': [
-        {'Key': '2017/foo', 'LastModified': last_modified},
-        {'Key': '2017/bar', 'LastModified': last_modified},
+        {'Key': '2017/foo', 'Size': 10, 'LastModified': last_modified, 'ETag': '"foo"'},
+        {'Key': '2017/bar', 'Size': 20, 'LastModified': last_modified, 'ETag': '"bar"'},
     ]}]
 
     s3 = S3('ap', 'foo.org')
@@ -443,7 +573,10 @@ def test_list_s3_objects(mocker):
     result = s3._list_s3_objects(client, '2017/')
 
     mock_paginator.paginate.assert_called_with(Bucket='foo.org', Prefix='2017/')
-    assert result == {'foo': last_modified, 'bar': last_modified}
+    assert result == {
+        'foo': {'Size': 10, 'LastModified': last_modified, 'ETag': '"foo"'},
+        'bar': {'Size': 20, 'LastModified': last_modified, 'ETag': '"bar"'},
+    }
 
 
 def test_list_s3_objects_empty_page(mocker):

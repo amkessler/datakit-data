@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import datetime, timezone
 from logging import NullHandler
 
 import boto3
@@ -33,9 +34,16 @@ class S3:
         client = self._client()
         failures = 0
         local_files = {k: v for k, v in self._list_local_files(data_dir).items() if not k.endswith('.synced')}
+        remote_objects = self._list_s3_objects(client, prefix)
         for rel_path, local_path in sorted(local_files.items()):
+            remote_obj = remote_objects.get(rel_path)
+            should_upload, reason = self._should_upload(local_path, remote_obj)
+            if not should_upload:
+                if sync_status_dir is not None and not dryrun:
+                    self._create_sync_marker(rel_path, sync_status_dir)
+                continue
             key = prefix + rel_path
-            logger.info(f"upload: {local_path} to s3://{self.bucket}/{key}")
+            logger.info(f"upload: {local_path} to s3://{self.bucket}/{key} ({reason})")
             if not dryrun:
                 try:
                     client.upload_file(local_path, self.bucket, key)
@@ -45,8 +53,7 @@ class S3:
                     failures += 1
                     logger.info(f"\n*** Error ***\n{e}\n")
         if delete:
-            remote_keys = self._list_s3_keys(client, prefix)
-            remote_rel = {k[len(prefix):] for k in remote_keys}
+            remote_rel = set(remote_objects)
             to_delete = [prefix + rel_path for rel_path in sorted(remote_rel - set(local_files.keys()))]
             for key in to_delete:
                 logger.info(f"delete: s3://{self.bucket}/{key}")
@@ -134,6 +141,30 @@ class S3:
                 logger.info(f"\n*** Error ***\n{error.get('Key')}: {error.get('Message')}\n")
         return failures
 
+    def _should_upload(self, local_path, remote_obj):
+        if remote_obj is None:
+            return True, 'missing on S3'
+
+        local_size = os.path.getsize(local_path)
+        if local_size != remote_obj['Size']:
+            return True, 'size differs'
+
+        local_mtime = datetime.fromtimestamp(os.path.getmtime(local_path), tz=timezone.utc)
+        remote_mtime = self._last_modified(remote_obj)
+        if local_mtime > remote_mtime:
+            return True, 'local file is newer'
+
+        return False, 'remote object is current'
+
+    def _last_modified(self, remote_obj):
+        if isinstance(remote_obj, dict):
+            remote_mtime = remote_obj['LastModified']
+        else:
+            remote_mtime = remote_obj
+        if remote_mtime.tzinfo is None:
+            remote_mtime = remote_mtime.replace(tzinfo=timezone.utc)
+        return remote_mtime
+
     def _list_s3_keys(self, client, prefix):
         keys = []
         paginator = client.get_paginator('list_objects_v2')
@@ -148,5 +179,10 @@ class S3:
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get('Contents', []):
                 rel_path = obj['Key'][len(prefix):]
-                objects[rel_path] = obj['LastModified']
+                if rel_path:
+                    objects[rel_path] = {
+                        'Size': obj['Size'],
+                        'LastModified': obj['LastModified'],
+                        'ETag': obj.get('ETag'),
+                    }
         return objects
