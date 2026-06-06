@@ -32,6 +32,7 @@ def test_push(mocker):
         'foo': 'data/foo', 'bar': 'data/bar'
     })
     mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch.object(S3, '_set_local_mtime')
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
 
@@ -53,6 +54,7 @@ def test_pull(mocker):
         'foo': _remote_object(),
         'bar': _remote_object(),
     })
+    mocker.patch.object(S3, '_set_local_mtime')
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mocker.patch('datakit_data.s3.os.makedirs')
@@ -72,7 +74,9 @@ def test_push_creates_sync_markers(mocker, tmpdir):
     sync_dir = str(tmpdir.mkdir('sync'))
     open(os.path.join(data_dir, 'foo.csv'), 'w').close()
     mocker.patch.object(S3, '_list_s3_objects', return_value={})
-    mocker.patch('datakit_data.s3.boto3.Session')
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_client.head_object.return_value = {'LastModified': datetime.now(tz=timezone.utc)}
 
     s3 = S3('ap', 'foo.org')
     s3.push(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
@@ -90,6 +94,7 @@ def test_push_skips_synced_files(mocker):
         'subdir/bar.synced': 'data/subdir/bar.synced',
     })
     mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch.object(S3, '_set_local_mtime')
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
 
@@ -151,6 +156,7 @@ def test_push_uploads_when_local_file_is_newer(mocker, tmpdir):
     })
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
+    mock_client.head_object.return_value = {'LastModified': datetime.now(tz=timezone.utc)}
 
     s3 = S3('ap', 'foo.org')
     result = s3.push(data_dir, '2017/fake-project')
@@ -173,6 +179,7 @@ def test_push_uploads_when_size_differs(mocker, tmpdir):
     })
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
+    mock_client.head_object.return_value = {'LastModified': datetime.now(tz=timezone.utc)}
 
     s3 = S3('ap', 'foo.org')
     result = s3.push(data_dir, '2017/fake-project')
@@ -258,6 +265,55 @@ def test_pull_downloads_when_remote_object_is_newer(mocker, tmpdir):
     )
 
 
+def test_push_sets_local_mtime_to_uploaded_object_last_modified(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    marker_path = os.path.join(sync_dir, 'foo.csv.synced')
+    local_mtime = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    _make_file(local_path, content='abc', mtime=local_mtime)
+    uploaded_mtime = datetime(2024, 1, 15, 12, 5, 0, tzinfo=timezone.utc)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_client.head_object.return_value = {'LastModified': uploaded_mtime}
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
+
+    assert result == 0
+    mock_client.head_object.assert_called_once_with(
+        Bucket='foo.org',
+        Key='2017/fake-project/foo.csv',
+    )
+    assert abs(os.path.getmtime(local_path) - uploaded_mtime.timestamp()) < 0.001
+    assert abs(os.path.getmtime(marker_path) - uploaded_mtime.timestamp()) < 0.001
+
+
+def test_pull_sets_local_mtime_to_remote_object_last_modified(mocker, tmpdir):
+    data_dir = str(tmpdir.mkdir('data'))
+    local_path = os.path.join(data_dir, 'foo.csv')
+    local_mtime = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    _make_file(local_path, content='abc', mtime=local_mtime)
+    remote_mtime = datetime(2024, 1, 15, 12, 5, 0, tzinfo=timezone.utc)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'foo.csv': _remote_object(size=3, last_modified=remote_mtime)
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project')
+
+    assert result == 0
+    mock_client.download_file.assert_called_once_with(
+        'foo.org',
+        '2017/fake-project/foo.csv',
+        local_path,
+    )
+    assert abs(os.path.getmtime(local_path) - remote_mtime.timestamp()) < 0.001
+
+
 def test_pull_downloads_when_size_differs(mocker, tmpdir):
     data_dir = str(tmpdir.mkdir('data'))
     local_path = os.path.join(data_dir, 'foo.csv')
@@ -321,6 +377,7 @@ def test_push_delete(mocker):
     mocker.patch.object(S3, '_list_s3_objects', return_value={
         'stale': _remote_object(),
     })
+    mocker.patch.object(S3, '_set_local_mtime')
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.delete_objects.return_value = {'Deleted': [{'Key': '2017/fake-project/stale'}]}
@@ -443,6 +500,7 @@ def test_push_delete_batch_error(caplog, mocker):
         'stale1': _remote_object(),
         'stale2': _remote_object(),
     })
+    mocker.patch.object(S3, '_set_local_mtime')
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.delete_objects.side_effect = ClientError(
@@ -465,6 +523,7 @@ def test_push_delete_partial_error(caplog, mocker):
         'stale1': _remote_object(),
         'stale2': _remote_object(),
     })
+    mocker.patch.object(S3, '_set_local_mtime')
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mock_client.delete_objects.return_value = {
@@ -503,6 +562,7 @@ def test_push_empty_path_without_delete_allowed(mocker):
     """
     mocker.patch.object(S3, '_list_local_files', return_value={'foo': 'data/foo'})
     mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch.object(S3, '_set_local_mtime')
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
 
@@ -557,6 +617,7 @@ def test_push_logging(caplog, mocker):
         'foo': 'data/foo', 'bar': 'data/bar'
     })
     mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch.object(S3, '_set_local_mtime')
     mocker.patch('datakit_data.s3.boto3.Session')
 
     s3 = S3('ap', 'foo.org')
@@ -574,6 +635,7 @@ def test_pull_logging(caplog, mocker):
         'foo': _remote_object(),
         'bar': _remote_object(),
     })
+    mocker.patch.object(S3, '_set_local_mtime')
     mocker.patch('datakit_data.s3.boto3.Session')
     mocker.patch('datakit_data.s3.os.makedirs')
 

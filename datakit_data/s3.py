@@ -47,8 +47,10 @@ class S3:
             if not dryrun:
                 try:
                     client.upload_file(local_path, self.bucket, key)
+                    remote_obj = client.head_object(Bucket=self.bucket, Key=key)
+                    remote_timestamp = self._set_local_mtime(local_path, remote_obj)
                     if sync_status_dir is not None:
-                        self._create_sync_marker(rel_path, sync_status_dir)
+                        self._create_sync_marker(rel_path, sync_status_dir, mtime=remote_timestamp)
                 except (ClientError, BotoCoreError) as e:
                     failures += 1
                     logger.info(f"\n*** Error ***\n{e}\n")
@@ -84,6 +86,7 @@ class S3:
                 os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
                 try:
                     client.download_file(self.bucket, key, local_path)
+                    self._set_local_mtime(local_path, remote_obj)
                 except (ClientError, BotoCoreError) as e:
                     failures += 1
                     logger.info(f"\n*** Error ***\n{e}\n")
@@ -106,10 +109,12 @@ class S3:
             return ''
         return s3_path.strip('/') + '/'
 
-    def _create_sync_marker(self, rel_path, sync_status_dir):
+    def _create_sync_marker(self, rel_path, sync_status_dir, mtime=None):
         marker_path = os.path.join(sync_status_dir, rel_path + '.synced')
         os.makedirs(os.path.dirname(os.path.abspath(marker_path)), exist_ok=True)
         open(marker_path, 'w').close()
+        if mtime is not None:
+            os.utime(marker_path, (mtime, mtime))
 
     def _list_local_files(self, data_dir):
         files = {}
@@ -182,6 +187,12 @@ class S3:
         if remote_mtime.tzinfo is None:
             remote_mtime = remote_mtime.replace(tzinfo=timezone.utc)
         return remote_mtime
+
+    def _set_local_mtime(self, local_path, remote_obj):
+        remote_mtime = self._last_modified(remote_obj)
+        remote_timestamp = remote_mtime.timestamp()
+        os.utime(local_path, (remote_timestamp, remote_timestamp))
+        return remote_timestamp
 
     def _list_s3_keys(self, client, prefix):
         keys = []
