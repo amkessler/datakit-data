@@ -164,31 +164,38 @@ Pushing and pulling data between your local machine and the S3 data store requir
     $ datakit data pull
 
 
-The above commands provide a human-friendly interface to the `AWS S3 sync`_ command and line utility.
+The above commands use `boto3`_ to provide sync-like behavior between a project's local
+`data/` directory (and its subdirectories) and the S3 bucket and path specified in
+`config/datakit-data.json`.
 
-The sync utility writes all files in a project's  local `data/` directory (and its subdirectories) to the
-S3 bucket and path specified in `config/datakit-data.json`, or vice versa.
+When pushing, `datakit-data` uploads a local file if the corresponding S3 object is missing,
+if the file size differs, or if the local file is newer than the S3 object. When pulling,
+it downloads an S3 object if the corresponding local file is missing, if the file size
+differs, or if the S3 object is newer than the local file.
+
+After successful transfers, local file modification times are aligned to the S3 object's
+`LastModified` timestamp. When `sync_status_location` is configured, `data push` also
+creates or refreshes `.synced` marker files that the `data status` command can use for
+fast local status checks.
 
 By default, this command does not delete previously written files in a target location
 if they have been removed in the source location.
 
-This functionality is available, however, via the `\-\-delete` flag of the underlying `AWS S3 sync`_ utility.
-`datakit-data` provides access to the `\-\-delete` flag and a limited set of other options provided by the `sync`
-command (see :ref:`usage-extraflags`).
+This functionality is available, however, via the `delete` extra flag (see
+:ref:`usage-extraflags`). For safety, `datakit-data` refuses delete operations when
+`s3_path` is empty, because that would operate across the whole bucket.
 
 .. _usage-extraflags:
 
 Extra flags
 ~~~~~~~~~~~~
 
-While `datakit-data` is intended to simplify and standardize working with S3 as a data store, it
-also exposes a subset of more advanced options for the underlying `AWS S3 sync`_ utility.
+While `datakit-data` is intended to simplify and standardize working with S3 as a data store,
+it also exposes a small set of boolean extra flags for the plugin's `push` and `pull` commands.
 
-Users can pass any **boolean** flag supported by *S3 sync* to the plugin's `push` or `pull` commands.
+Boolean flags are those that do not accept values; calling them toggles behavior on or off.
 
-Boolean flags are those that do not accept values (i.e. simply calling them toggles a behavior on or off).
-
-The flags must be passed to `datakit` as additional paramaters **without leading dashes** [2]_ 
+The flags must be passed to `datakit` as additional parameters **without leading dashes** [2]_
 
 For example, to delete files on S3 that are *not* present locally::
 
@@ -202,8 +209,17 @@ To view which files will be affected before pushing data to S3::
 
   $ datakit data push delete dryrun
 
+Currently supported extra flags:
 
-Please refer to the `AWS S3 sync`_ documentation for details on other boolean flags.
+**dryrun**
+  Log the upload, download, or delete operations that would run without changing local files,
+  S3 objects, or `.synced` markers. `dry-run` is also accepted internally.
+
+**delete**
+  During `push`, delete S3 objects under the configured `s3_path` that do not have a
+  corresponding local file. During `pull`, delete local files under `data/` that do not
+  have a corresponding S3 object. `.synced` marker files are ignored when deciding what
+  to delete.
 
 
 .. _usage-vcs--and-data:
@@ -227,7 +243,7 @@ the `data/` directory itself *should be excluded from version control.*
 
 
 .. _`AWS S3`: https://aws.amazon.com/s3/
-.. _`AWS S3 sync`: http://docs.aws.amazon.com/cli/latest/reference/s3/sync.html
+.. _`boto3`: https://boto3.amazonaws.com/v1/documentation/api/latest/index.html
 .. _`secret keys`: http://docs.aws.amazon.com/general/latest/gr/aws-sec-cred-types.html#access-keys-and-secret-access-keys
 .. _`aws configure`: http://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html
 .. _datakit: https://github.com/associatedpress/datakit-core
@@ -235,5 +251,5 @@ the `data/` directory itself *should be excluded from version control.*
 .. _`.gitignore`: https://git-scm.com/docs/gitignore
 
 .. [1] datakit-data does not currently guard against overwrites of pre-existing projects of the same name.
-.. [2] Leading dashes must be dropped to enable datakit to differentiate between its own flags and those intended for
-   pass-through to the underlying AWS S3 sync utility.
+.. [2] Leading dashes must be dropped to enable datakit to differentiate between its own flags and
+   extra flags intended for `datakit-data`.

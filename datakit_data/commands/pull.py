@@ -17,7 +17,7 @@ class Pull(ProjectMixin, CommandHelpers, Command):
         parser.add_argument(
             'args',
             nargs=argparse.REMAINDER,
-            help="One or more boolean S3 sync flags without leading dashes, e.g. delete or dryrun"
+            help="One or more boolean extra flags without leading dashes, e.g. delete or dryrun"
         )
         return parser
 
