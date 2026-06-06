@@ -71,7 +71,7 @@ class S3:
             return 1
         client = self._client()
         failures = 0
-        local_files = self._list_local_files(data_dir)
+        local_files = {k: v for k, v in self._list_local_files(data_dir).items() if not k.endswith('.synced')}
         remote_objects = self._list_s3_objects(client, prefix)
         for rel_path, remote_obj in sorted(remote_objects.items()):
             local_path = os.path.join(data_dir, rel_path)

@@ -341,6 +341,28 @@ def test_pull_delete(mocker):
     mock_remove.assert_called_once_with('data/stale')
 
 
+def test_pull_delete_ignores_synced_marker_files(mocker):
+    """
+    S3.pull with --delete ignores .synced marker files when deciding which local
+    files are absent from S3.
+    """
+    mocker.patch.object(S3, '_list_s3_objects', return_value={'foo': _remote_object()})
+    mocker.patch.object(S3, '_should_download', return_value=(False, 'local file is current'))
+    mocker.patch.object(S3, '_list_local_files', return_value={
+        'foo': 'data/foo',
+        'foo.synced': 'data/foo.synced',
+        'subdir/bar.synced': 'data/subdir/bar.synced',
+        'stale': 'data/stale',
+    })
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mock_remove = mocker.patch('datakit_data.s3.os.remove')
+
+    s3 = S3('ap', 'foo.org')
+    s3.pull('data/', '2017/fake-project', extra_flags=['--delete'])
+
+    mock_remove.assert_called_once_with('data/stale')
+
+
 def test_push_client_error(caplog, mocker):
     """
     S3.push logs an error message and counts the failure when boto3 raises a ClientError.
