@@ -166,6 +166,10 @@ Pushing and pulling data between your local machine and the S3 data store requir
 
 `push` sends files in the local `data/` directory to the S3 bucket and path in `config/datakit-data.json`, `pull` goes the other way from S3 to the local `data/` directory.
 
+When `sync_status_location` is configured, each successful transfer writes a corresponding `.synced`
+file containing the S3 object's current ETag. Those markers let later pushes detect local changes
+and later pulls detect whether the remote object has changed since the last sync.
+
 By default, neither command removes files in the destination that have been deleted from the source.
 To also prune those files, use the `delete` flag (see :ref:`usage-extraflags`).
 

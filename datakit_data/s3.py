@@ -218,7 +218,9 @@ class S3:
         paginator = client.get_paginator('list_objects_v2')
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get('Contents', []):
-                keys.append(obj['Key'])
+                rel_path = obj['Key'][len(prefix):]
+                if rel_path and not rel_path.endswith('/'):
+                    keys.append(obj['Key'])
         return keys
 
     def _list_s3_objects(self, client, prefix):
@@ -227,5 +229,6 @@ class S3:
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get('Contents', []):
                 rel_path = obj['Key'][len(prefix):]
-                objects[rel_path] = S3ObjectInfo(etag=self._normalize_etag(obj.get('ETag')))
+                if rel_path and not rel_path.endswith('/'):
+                    objects[rel_path] = S3ObjectInfo(etag=self._normalize_etag(obj.get('ETag')))
         return objects

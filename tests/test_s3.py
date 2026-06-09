@@ -471,6 +471,27 @@ def test_push_client_error(caplog, mocker):
     assert '*** Error ***' in caplog.text
 
 
+def test_push_failed_upload_does_not_create_sync_marker(caplog, mocker, tmpdir):
+    """
+    S3.push only creates a .synced marker after the upload succeeds and an ETag is available.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    data_file = os.path.join(data_dir, 'foo.csv')
+    open(data_file, 'w').close()
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mocker.patch.object(S3, '_upload', side_effect=ClientError(
+        {'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}}, 'PutObject'
+    ))
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
+
+    assert result == 1
+    assert '*** Error ***' in caplog.text
+    assert not os.path.exists(os.path.join(sync_dir, 'foo.csv.synced'))
+
+
 def test_push_connection_error(caplog, mocker):
     """
     S3.push also catches non-ClientError botocore errors (e.g. connection failures).
@@ -717,6 +738,26 @@ def test_list_s3_keys(mocker):
     assert result == ['2017/foo', '2017/bar']
 
 
+def test_list_s3_keys_ignores_directory_markers(mocker):
+    """
+    _list_s3_keys ignores S3 console directory marker objects instead of treating them as files.
+    """
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_paginator = mock_client.get_paginator.return_value
+    mock_paginator.paginate.return_value = [{'Contents': [
+        {'Key': '2017/'},
+        {'Key': '2017/subdir/'},
+        {'Key': '2017/subdir/foo.csv'},
+    ]}]
+
+    s3 = S3('ap', 'foo.org')
+    client = s3._client()
+    result = s3._list_s3_keys(client, '2017/')
+
+    assert result == ['2017/subdir/foo.csv']
+
+
 def test_list_s3_keys_empty_page(mocker):
     """
     _list_s3_keys returns an empty list when the S3 response page has no Contents.
@@ -751,6 +792,23 @@ def test_list_s3_objects(mocker):
         'foo': S3ObjectInfo(etag='aaa'),
         'bar': S3ObjectInfo(etag='bbb'),
     }
+
+
+def test_list_s3_objects_ignores_directory_markers(mocker):
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_paginator = mock_client.get_paginator.return_value
+    mock_paginator.paginate.return_value = [{'Contents': [
+        {'Key': '2017/', 'ETag': '"root"'},
+        {'Key': '2017/subdir/', 'ETag': '"directory"'},
+        {'Key': '2017/subdir/foo.csv', 'ETag': '"aaa"'},
+    ]}]
+
+    s3 = S3('ap', 'foo.org')
+    client = s3._client()
+    result = s3._list_s3_objects(client, '2017/')
+
+    assert result == {'subdir/foo.csv': S3ObjectInfo(etag='aaa')}
 
 
 def test_list_s3_objects_empty_page(mocker):
