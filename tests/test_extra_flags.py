@@ -28,4 +28,4 @@ def test_unsupported_empty_when_all_known():
     """
     ExtraFlags.unsupported is empty when every flag is supported.
     """
-    assert ExtraFlags.unsupported(['dryrun', 'dry-run', 'delete', 'force', '--force']) == []
+    assert ExtraFlags.unsupported(['dryrun', 'dry-run', 'delete', 'force', '--force', 'verbose']) == []

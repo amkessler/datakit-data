@@ -1,6 +1,8 @@
 import os
 import time
+import threading
 
+import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 
 from datakit_data.s3 import S3, S3ObjectInfo, list_local_files
@@ -94,7 +96,32 @@ def test_push_skips_unchanged(caplog, mocker, tmpdir):
 
     assert result == 0
     mock_client.upload_file.assert_not_called()
-    assert 'skipped: ' in caplog.text
+    assert 'skipped: ' not in caplog.text
+    assert 'push summary: selected=1 uploaded=0 skipped=1 failed=0' in caplog.text
+
+
+def test_push_verbose_logs_skipped_files(caplog, mocker, tmpdir):
+    """
+    S3.push logs per-file skipped output only when verbose mode is enabled.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    data_file = os.path.join(data_dir, 'foo.csv')
+    open(data_file, 'w').close()
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    SyncMarkers(sync_dir).write('foo.csv', 'etag123')
+    now = time.time()
+    os.utime(data_file, (now - 100, now - 100))
+    os.utime(os.path.join(sync_dir, 'foo.csv.synced'), (now, now))
+
+    result = s3.push(data_dir, '2017/fake-project', extra_flags=['--verbose'], sync_status_dir=sync_dir)
+
+    assert result == 0
+    mock_client.upload_file.assert_not_called()
+    assert f'skipped: {data_file}' in caplog.text
 
 
 def test_push_force_uploads_even_when_marker_fresh(mocker, tmpdir):
@@ -344,6 +371,172 @@ def test_push_skips_synced_files(mocker, tmpdir):
     assert not any('.synced' in key for key in upload_keys)
 
 
+def test_push_path_limits_selected_subtree(mocker, tmpdir):
+    """
+    S3.push can limit traversal to a selected subtree under data/.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    current_dir = os.path.join(data_dir, 'source', 'current')
+    old_dir = os.path.join(data_dir, 'source', 'old')
+    os.makedirs(current_dir)
+    os.makedirs(old_dir)
+    open(os.path.join(current_dir, 'foo.csv'), 'w').close()
+    open(os.path.join(old_dir, 'bar.csv'), 'w').close()
+    mocker.patch('datakit_data.s3.boto3.Session')
+    upload = mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    s3.push(data_dir, '2017/fake-project', paths=['data/source/current'])
+
+    upload_keys = {call.args[2] for call in upload.call_args_list}
+    assert upload_keys == {'2017/fake-project/source/current/foo.csv'}
+
+
+def test_list_local_files_rejects_paths_outside_data_root(tmpdir):
+    """
+    Targeted paths cannot escape the configured data directory.
+    """
+    project_dir = str(tmpdir)
+    data_dir = os.path.join(project_dir, 'data')
+    outside_dir = os.path.join(project_dir, 'outside')
+    os.makedirs(data_dir)
+    os.makedirs(outside_dir)
+    open(os.path.join(outside_dir, 'secret.csv'), 'w').close()
+
+    result = list_local_files(data_dir, paths=['../outside'])
+
+    assert result == {}
+
+
+def test_push_include_and_exclude_patterns(mocker, tmpdir):
+    """
+    S3.push applies include and exclude globs to relative data paths.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    os.makedirs(os.path.join(data_dir, 'source'))
+    os.makedirs(os.path.join(data_dir, 'tmp'))
+    open(os.path.join(data_dir, 'source', 'keep.csv'), 'w').close()
+    open(os.path.join(data_dir, 'source', 'skip.txt'), 'w').close()
+    open(os.path.join(data_dir, 'tmp', 'drop.csv'), 'w').close()
+    mocker.patch('datakit_data.s3.boto3.Session')
+    upload = mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    s3.push(
+        data_dir,
+        '2017/fake-project',
+        include_patterns=['*.csv'],
+        exclude_patterns=['tmp/*'],
+    )
+
+    upload_keys = {call.args[2] for call in upload.call_args_list}
+    assert upload_keys == {'2017/fake-project/source/keep.csv'}
+
+
+def test_push_parallel_uploads_use_worker_clients(mocker, tmpdir):
+    """
+    S3.push creates worker-local boto3 clients when parallel uploads are requested.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    open(os.path.join(data_dir, 'foo.csv'), 'w').close()
+    open(os.path.join(data_dir, 'bar.csv'), 'w').close()
+    barrier = threading.Barrier(2)
+    clients = [object(), object()]
+    client_calls = []
+    client_lock = threading.Lock()
+
+    def client_side_effect():
+        with client_lock:
+            client = clients[len(client_calls)]
+            client_calls.append(client)
+        return client
+
+    def upload_side_effect(client, local_path, key, need_etag):
+        barrier.wait(timeout=5)
+        return 'etag'
+
+    mocker.patch.object(S3, '_client', side_effect=client_side_effect)
+    upload = mocker.patch.object(S3, '_upload', side_effect=upload_side_effect)
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', jobs=2)
+
+    assert result == 0
+    assert len(client_calls) == 2
+    assert {call.args[0] for call in upload.call_args_list} == set(clients)
+
+
+def test_push_parallel_aggregates_upload_failures(caplog, mocker, tmpdir):
+    """
+    S3.push counts upload failures raised by parallel workers.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    open(os.path.join(data_dir, 'good.csv'), 'w').close()
+    open(os.path.join(data_dir, 'bad.csv'), 'w').close()
+    mocker.patch.object(S3, '_client', return_value=object())
+
+    def upload_side_effect(client, local_path, key, need_etag):
+        if key.endswith('bad.csv'):
+            raise ClientError({'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}}, 'PutObject')
+        return 'etag'
+
+    mocker.patch.object(S3, '_upload', side_effect=upload_side_effect)
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', jobs=2)
+
+    assert result == 1
+    assert '*** Error ***' in caplog.text
+    assert 'push summary: selected=2 uploaded=1 skipped=0 failed=1' in caplog.text
+
+
+def test_push_preflight_reports_broken_symlink(caplog, mocker, tmpdir):
+    """
+    S3.push reports broken symlinks before starting uploads.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    broken_path = os.path.join(data_dir, 'broken.csv')
+    try:
+        os.symlink('missing.csv', broken_path)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable on this platform")
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    upload = mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project')
+
+    assert result == 1
+    assert 'preflight error:' in caplog.text
+    assert 'broken symlink' in caplog.text
+    mock_session.assert_not_called()
+    upload.assert_not_called()
+
+
+def test_push_preflight_only_checks_selected_paths(mocker, tmpdir):
+    """
+    S3.push preflight is scoped after path filtering, so unrelated bad paths do not block a
+    targeted push.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    current_dir = os.path.join(data_dir, 'source', 'current')
+    os.makedirs(current_dir)
+    open(os.path.join(current_dir, 'foo.csv'), 'w').close()
+    try:
+        os.symlink('missing.csv', os.path.join(data_dir, 'broken.csv'))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable on this platform")
+    mocker.patch('datakit_data.s3.boto3.Session')
+    upload = mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', paths=['source/current'])
+
+    assert result == 0
+    upload.assert_called_once()
+    assert upload.call_args.args[2] == '2017/fake-project/source/current/foo.csv'
+
+
 def test_push_dryrun(mocker):
     """
     S3.push with --dryrun logs intended uploads without transferring anything.
@@ -556,6 +749,22 @@ def test_push_delete_empty_path_refused(caplog, mocker):
     list_local.assert_not_called()
 
 
+def test_push_delete_with_filters_refused(caplog, mocker):
+    """
+    S3.push refuses --delete with local push filters because the remote comparison would be unsafe.
+    """
+    list_local = mocker.patch('datakit_data.s3.list_local_files')
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push('data/', '2017/fake-project', extra_flags=['--delete'], paths=['source/current'])
+
+    assert result == 1
+    assert 'Refusing --delete with push filters' in caplog.text
+    mock_session.assert_not_called()
+    list_local.assert_not_called()
+
+
 def test_push_empty_path_without_delete_allowed(mocker):
     """
     An empty s3_path is allowed without --delete (e.g. a dedicated bucket); keys are built
@@ -623,6 +832,7 @@ def test_push_logging(caplog, mocker):
 
     assert 'upload: data/foo to s3://foo.org/2017/fake-project/foo' in caplog.text
     assert 'upload: data/bar to s3://foo.org/2017/fake-project/bar' in caplog.text
+    assert 'push summary: selected=2 uploaded=2 skipped=0 failed=0' in caplog.text
 
 
 def test_pull_logging(caplog, mocker):
@@ -719,6 +929,26 @@ def test_list_s3_keys(mocker):
     assert result == ['2017/foo', '2017/bar']
 
 
+def test_list_s3_keys_ignores_directory_markers(mocker):
+    """
+    _list_s3_keys ignores S3 console directory marker objects instead of treating them as files.
+    """
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_paginator = mock_client.get_paginator.return_value
+    mock_paginator.paginate.return_value = [{'Contents': [
+        {'Key': '2017/'},
+        {'Key': '2017/subdir/'},
+        {'Key': '2017/subdir/foo.csv'},
+    ]}]
+
+    s3 = S3('ap', 'foo.org')
+    client = s3._client()
+    result = s3._list_s3_keys(client, '2017/')
+
+    assert result == ['2017/subdir/foo.csv']
+
+
 def test_list_s3_keys_empty_page(mocker):
     """
     _list_s3_keys returns an empty list when the S3 response page has no Contents.
@@ -753,6 +983,23 @@ def test_list_s3_objects(mocker):
         'foo': S3ObjectInfo(etag='aaa'),
         'bar': S3ObjectInfo(etag='bbb'),
     }
+
+
+def test_list_s3_objects_ignores_directory_markers(mocker):
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_paginator = mock_client.get_paginator.return_value
+    mock_paginator.paginate.return_value = [{'Contents': [
+        {'Key': '2017/', 'ETag': '"root"'},
+        {'Key': '2017/subdir/', 'ETag': '"directory"'},
+        {'Key': '2017/subdir/foo.csv', 'ETag': '"aaa"'},
+    ]}]
+
+    s3 = S3('ap', 'foo.org')
+    client = s3._client()
+    result = s3._list_s3_objects(client, '2017/')
+
+    assert result == {'subdir/foo.csv': S3ObjectInfo(etag='aaa')}
 
 
 def test_list_s3_objects_empty_page(mocker):

@@ -10,6 +10,11 @@ from ..project_mixin import ProjectMixin
 from ..s3 import S3
 
 
+def _parsed_list(parsed_args, name):
+    value = getattr(parsed_args, name, None)
+    return value if isinstance(value, list) else []
+
+
 class Push(ProjectMixin, CommandHelpers, Command):
 
     "Push local data to S3"
@@ -28,10 +33,40 @@ class Push(ProjectMixin, CommandHelpers, Command):
             help="Push every file, ignoring sync status checks"
         )
         parser.add_argument(
+            '--verbose',
+            action='store_true',
+            default=False,
+            help="Log per-file skipped output during push"
+        )
+        parser.add_argument(
             '--sync-status-in-data',
             action='store_true',
             default=False,
             help="Create sync status files in data/ instead of the configured location"
+        )
+        parser.add_argument(
+            '--path',
+            action='append',
+            default=[],
+            help="Only push files under this data/ path. May be repeated."
+        )
+        parser.add_argument(
+            '--include',
+            action='append',
+            default=[],
+            help="Only push relative data paths matching this glob. May be repeated."
+        )
+        parser.add_argument(
+            '--exclude',
+            action='append',
+            default=[],
+            help="Skip relative data paths matching this glob. May be repeated."
+        )
+        parser.add_argument(
+            '--jobs',
+            type=int,
+            default=1,
+            help="Number of parallel upload workers to use. Defaults to 1."
         )
         return parser
 
@@ -48,6 +83,8 @@ class Push(ProjectMixin, CommandHelpers, Command):
         clean_flags = ExtraFlags.convert(parsed_args.args)
         if getattr(parsed_args, 'force', False) is True and '--force' not in clean_flags:
             clean_flags.append('--force')
+        if getattr(parsed_args, 'verbose', False) is True and '--verbose' not in clean_flags:
+            clean_flags.append('--verbose')
         unsupported = ExtraFlags.unsupported(parsed_args.args)
         if unsupported:
             self.log.info(f"Ignoring unsupported flag(s): {', '.join(unsupported)}")
@@ -60,11 +97,26 @@ class Push(ProjectMixin, CommandHelpers, Command):
                 write_json(self.project_config_path, configs)
         else:
             sync_status_dir = self.project_configs.get('sync_status_location')
+        push_kwargs = {
+            'extra_flags': clean_flags,
+            'sync_status_dir': sync_status_dir,
+        }
+        paths = _parsed_list(parsed_args, 'path')
+        include_patterns = _parsed_list(parsed_args, 'include')
+        exclude_patterns = _parsed_list(parsed_args, 'exclude')
+        if paths:
+            push_kwargs['paths'] = paths
+        if include_patterns:
+            push_kwargs['include_patterns'] = include_patterns
+        if exclude_patterns:
+            push_kwargs['exclude_patterns'] = exclude_patterns
+        jobs = getattr(parsed_args, 'jobs', 1)
+        if isinstance(jobs, int) and jobs != 1:
+            push_kwargs['jobs'] = jobs
         failures = s3.push(
             'data/',
             self.project_configs['s3_path'],
-            extra_flags=clean_flags,
-            sync_status_dir=sync_status_dir
+            **push_kwargs
         )
         if failures:
             self.log.info(f"{failures} file(s) failed to transfer")

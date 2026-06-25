@@ -207,12 +207,44 @@ To push every local data file regardless of sync status::
 
   $ datakit data push --force
 
-`delete`, `dryrun`, and `force` are the only supported flags; any other flag is ignored with a notice.
+`delete`, `dryrun`, `force`, and `verbose` are the only supported boolean flags; any other flag is ignored with a notice.
 
 .. note::
 
   For safety, `delete` is refused when `s3_path` is empty, as that would operate across the entire
   bucket. Set a non-empty `s3_path` in `config/datakit-data.json` to use it.
+
+Targeted pushes and large batches
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For large projects, `push` can limit local traversal before checking sync markers or uploading files.
+This is useful when a project keeps historical snapshots under `data/` but only the newest subtree
+needs to be pushed.
+
+To push one subtree under `data/`::
+
+  $ datakit data push --path data/source/current_snapshot/
+
+The `--path` value may be written relative to `data/` or with the leading `data/` prefix. It may be
+repeated to push multiple files or directories.
+
+To further restrict candidates by relative path globs::
+
+  $ datakit data push --path source/current_snapshot --include '*.csv' --exclude 'tmp/*'
+
+For safety, filtered pushes cannot be combined with `delete`; run an unfiltered delete separately if
+you intend to prune the entire configured S3 path.
+
+By default, `push` no longer logs one line for every skipped file. Use `--verbose` to restore
+per-file skipped output::
+
+  $ datakit data push --verbose
+
+For many small files, `push` can use parallel uploads with a bounded worker pool::
+
+  $ datakit data push --path source/current_snapshot --jobs 8
+
+The default is `--jobs 1`, which preserves serial upload behavior.
 
 Concurrency
 ~~~~~~~~~~~~

@@ -1,7 +1,7 @@
 class ExtraFlags:
 
     # Flags the plugin actually acts on (boto3 push/pull only honor these).
-    SUPPORTED = ('dryrun', 'dry-run', 'delete', 'force')
+    SUPPORTED = ('dryrun', 'dry-run', 'delete', 'force', 'verbose')
 
     @staticmethod
     def _normalize(flag):
