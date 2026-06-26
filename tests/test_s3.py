@@ -1797,6 +1797,40 @@ def test_list_data_files_excludes_archive_managed_paths(tmpdir):
     assert result == {'source/normal/b.txt': os.path.join(data_dir, 'source', 'normal', 'b.txt')}
 
 
+def test_list_data_files_prunes_archive_managed_walks(mocker, tmpdir):
+    """
+    Archive-managed directories are pruned before os.walk descends into their contents.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    snapshot_child_dir = os.path.join(snapshot_dir, 'nested')
+    normal_dir = os.path.join(data_dir, 'source', 'normal')
+    os.makedirs(snapshot_child_dir)
+    os.makedirs(normal_dir)
+    open(os.path.join(snapshot_child_dir, 'a.txt'), 'w').close()
+    open(os.path.join(normal_dir, 'b.txt'), 'w').close()
+    with open(os.path.join(sync_dir, 'datakit-data-archives.json'), 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+
+    original_walk = os.walk
+    walked_roots = []
+
+    def recording_walk(*args, **kwargs):
+        for root, dirnames, filenames in original_walk(*args, **kwargs):
+            walked_roots.append(root)
+            yield root, dirnames, filenames
+
+    mocker.patch('datakit_data.s3.os.walk', side_effect=recording_walk)
+
+    result = list_data_files(data_dir, sync_status_dir=sync_dir, skip_archive_managed=True)
+
+    assert result == {'source/normal/b.txt': os.path.join(data_dir, 'source', 'normal', 'b.txt')}
+    assert normal_dir in walked_roots
+    assert snapshot_dir not in walked_roots
+    assert snapshot_child_dir not in walked_roots
+
+
 def test_list_local_files_nested_keys_use_forward_slashes(tmpdir):
     """
     Keys for files in subdirectories use forward slashes (matching S3 key syntax).

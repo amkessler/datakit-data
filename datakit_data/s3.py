@@ -196,7 +196,22 @@ def _filter_archive_managed_files(local_files, archive_paths):
     }
 
 
-def list_local_files(data_dir, paths=None, include_patterns=None, exclude_patterns=None, ignored_rel_paths=None):
+def _normalized_archive_paths(archive_paths):
+    return [
+        rel_path
+        for rel_path in (_normalize_archive_manifest_path(path) for path in archive_paths or [])
+        if rel_path is not None
+    ]
+
+
+def _join_rel_path(root_rel, name):
+    return _normalize_rel_path(os.path.join(root_rel, name)) if root_rel else _normalize_rel_path(name)
+
+
+def list_local_files(
+    data_dir, paths=None, include_patterns=None, exclude_patterns=None, ignored_rel_paths=None,
+    archive_paths_to_skip=None
+):
     # Map of rel_path -> full path for every data file under data_dir, excluding .synced
     # markers (which live alongside the data when sync_status_location is data/). The key is
     # used to build/compare S3 keys, which always use '/'; normalize the OS separator so keys
@@ -206,15 +221,34 @@ def list_local_files(data_dir, paths=None, include_patterns=None, exclude_patter
     include_patterns = [_strip_data_prefix(pattern) for pattern in include_patterns or []]
     exclude_patterns = [_strip_data_prefix(pattern) for pattern in exclude_patterns or []]
     ignored_rel_paths = set(ignored_rel_paths or [])
+    archive_paths_to_skip = _normalized_archive_paths(archive_paths_to_skip)
     files = {}
     for root_path in _candidate_roots(data_dir, paths):
         if os.path.isfile(root_path) or os.path.islink(root_path):
-            candidates = [(os.path.dirname(root_path), [os.path.basename(root_path)])]
+            root = os.path.dirname(root_path)
+            rel_path = os.path.relpath(root_path, data_dir).replace(os.sep, '/')
+            if any(_is_under_archive_path(rel_path, archive_path) for archive_path in archive_paths_to_skip):
+                continue
+            candidates = [(root, [], [os.path.basename(root_path)])]
         elif os.path.isdir(root_path):
-            candidates = ((root, filenames) for root, _, filenames in os.walk(root_path))
+            candidates = os.walk(root_path)
         else:
             continue
-        for root, filenames in candidates:
+        for root, dirnames, filenames in candidates:
+            root_rel = os.path.relpath(root, data_dir).replace(os.sep, '/')
+            if root_rel == '.':
+                root_rel = ''
+            if any(_is_under_archive_path(root_rel, archive_path) for archive_path in archive_paths_to_skip):
+                dirnames[:] = []
+                continue
+            if archive_paths_to_skip:
+                dirnames[:] = [
+                    dirname for dirname in dirnames
+                    if not any(
+                        _is_under_archive_path(_join_rel_path(root_rel, dirname), archive_path)
+                        for archive_path in archive_paths_to_skip
+                    )
+                ]
             for filename in filenames:
                 if filename.endswith(SyncMarkers.SUFFIX):
                     continue
@@ -232,15 +266,15 @@ def list_data_files(
     data_dir, sync_status_dir=None, paths=None, include_patterns=None, exclude_patterns=None,
     skip_archive_managed=False
 ):
+    archive_paths = read_archive_paths(sync_status_dir) if skip_archive_managed else []
     local_files = list_local_files(
         data_dir,
         paths=paths,
         include_patterns=include_patterns,
         exclude_patterns=exclude_patterns,
         ignored_rel_paths=_archive_metadata_rel_paths(data_dir, sync_status_dir),
+        archive_paths_to_skip=archive_paths,
     )
-    if skip_archive_managed:
-        local_files = _filter_archive_managed_files(local_files, read_archive_paths(sync_status_dir))
     return local_files
 
 
@@ -390,9 +424,8 @@ class S3:
             paths=paths,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            skip_archive_managed=True,
         )
-        if archive_paths:
-            local_files = _filter_archive_managed_files(local_files, archive_paths)
         started = time.monotonic()
         total = len(local_files)
         logger.info(f"push discovery: selected {total} file(s)")
