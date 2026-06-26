@@ -290,6 +290,47 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
+class _ArchiveUploadProgress:
+    def __init__(self, key, total_bytes, interval_seconds, interval_bytes):
+        self.key = key
+        self.total_bytes = total_bytes
+        self.interval_seconds = interval_seconds
+        self.interval_bytes = interval_bytes
+        self.transferred = 0
+        self.started = time.monotonic()
+        self.last_logged = self.started
+        self.last_logged_bytes = 0
+
+    def __call__(self, bytes_amount):
+        self.transferred += bytes_amount
+        now = time.monotonic()
+        should_log = (
+            self.transferred >= self.total_bytes or
+            (
+                now - self.last_logged >= self.interval_seconds and
+                self.transferred - self.last_logged_bytes >= self.interval_bytes
+            )
+        )
+        if should_log:
+            self._log(now)
+
+    def finish(self):
+        if self.transferred and self.transferred < self.total_bytes:
+            self._log(time.monotonic())
+
+    def _log(self, now):
+        elapsed = max(now - self.started, 0.001)
+        rate = self.transferred / elapsed
+        percent = (self.transferred / self.total_bytes * 100) if self.total_bytes else 100
+        logger.info(
+            f"archive upload progress: {self.key} "
+            f"{S3._format_bytes(self.transferred)}/{S3._format_bytes(self.total_bytes)} "
+            f"{percent:.1f}% rate={S3._format_bytes(rate)}/s elapsed={elapsed:.1f}s"
+        )
+        self.last_logged = now
+        self.last_logged_bytes = self.transferred
+
+
 class S3:
     """A limited, human-friendly interface to S3."""
 
@@ -301,6 +342,8 @@ class S3:
     # record is the one S3 itself reports, so it stays comparable to a later head/list probe.
     MULTIPART_THRESHOLD = 8 * 1024 * 1024
     PUSH_PROGRESS_INTERVAL = 1000
+    ARCHIVE_UPLOAD_PROGRESS_SECONDS = 5
+    ARCHIVE_UPLOAD_PROGRESS_BYTES = 64 * 1024 * 1024
 
     def __init__(self, aws_user_profile, s3_bucket):
         self.user_profile = aws_user_profile
@@ -465,9 +508,10 @@ class S3:
                 logger.info(f"preflight error: {issue.path}: {issue.message}")
             return len(issues)
         logger.info("archive preflight: ok")
-        logger.info(f"archive upload: {archive_rel} to s3://{self.bucket}/{archive_key}")
-        logger.info(f"archive upload: {manifest_rel} to s3://{self.bucket}/{manifest_key}")
         if dryrun:
+            logger.info(f"archive build: would create {archive_rel} from {len(local_files)} file(s)")
+            logger.info(f"archive upload: {archive_rel} to s3://{self.bucket}/{archive_key}")
+            logger.info(f"archive upload: {manifest_rel} to s3://{self.bucket}/{manifest_key}")
             if prune_individuals:
                 logger.info(
                     f"archive prune: would delete individual objects below "
@@ -483,8 +527,8 @@ class S3:
             with open(manifest_path, 'w') as f:
                 json.dump(manifest, f, indent=2, sort_keys=True)
             try:
-                archive_etag = self._upload(client, archive_path, archive_key, markers.enabled)
-                manifest_etag = self._upload(client, manifest_path, manifest_key, markers.enabled)
+                archive_etag = self._upload_archive_file(client, archive_path, archive_key, markers.enabled)
+                manifest_etag = self._upload_archive_file(client, manifest_path, manifest_key, markers.enabled)
                 if markers.enabled:
                     markers.write(archive_rel, archive_etag)
                     markers.write(manifest_rel, manifest_etag)
@@ -499,8 +543,11 @@ class S3:
     def _create_archive(self, data_dir, archive_root, local_files, archive_rel, archive_path):
         root_rel = os.path.relpath(archive_root, data_dir).replace(os.sep, '/')
         manifest_files = []
+        total = len(local_files)
+        started = time.monotonic()
+        logger.info(f"archive build: creating {archive_rel} from {total} file(s)")
         with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-            for rel_path, local_path in sorted(local_files.items()):
+            for processed, (rel_path, local_path) in enumerate(sorted(local_files.items()), start=1):
                 archive.write(local_path, arcname=rel_path)
                 stat = os.stat(local_path)
                 manifest_files.append({
@@ -508,6 +555,8 @@ class S3:
                     'size': stat.st_size,
                     'mtime': stat.st_mtime,
                 })
+                self._log_archive_build_progress(processed, total, archive_path, started)
+        self._log_archive_build_complete(archive_path, started)
         return {
             'version': 1,
             'archive_type': 'zip',
@@ -564,6 +613,14 @@ class S3:
             thread_clients.client = self._client()
         etag = self._upload(thread_clients.client, local_path, key, need_etag)
         return rel_path, etag
+
+    def _upload_archive_file(self, client, local_path, key, need_etag):
+        logger.info(f"archive upload: {os.path.basename(local_path)} to s3://{self.bucket}/{key}")
+        progress = self._archive_upload_progress_callback(local_path, key)
+        try:
+            return self._upload(client, local_path, key, need_etag, callback=progress)
+        finally:
+            progress.finish()
 
     def pull(
         self, data_dir, s3_path='', extra_flags=None, sync_status_dir=None,
@@ -825,7 +882,7 @@ class S3:
         response = client.head_object(Bucket=self.bucket, Key=key)
         return self._normalize_etag(response.get('ETag'))
 
-    def _upload(self, client, local_path, key, need_etag):
+    def _upload(self, client, local_path, key, need_etag, callback=None):
         # Upload a local file to `key` and return the object's S3 ETag (quotes stripped). Small
         # files go via put_object, whose response carries the ETag, so no extra head_object is
         # needed; larger files keep upload_file's managed multipart transfer and we read the ETag
@@ -836,8 +893,14 @@ class S3:
         if os.path.getsize(local_path) < self.MULTIPART_THRESHOLD:
             with open(local_path, 'rb') as body:
                 response = client.put_object(Bucket=self.bucket, Key=key, Body=body, ContentType=content_type)
+            if callback:
+                callback(os.path.getsize(local_path))
             return self._normalize_etag(response.get('ETag'))
-        client.upload_file(local_path, self.bucket, key, ExtraArgs={'ContentType': content_type})
+        extra_args = {'ContentType': content_type}
+        if callback:
+            client.upload_file(local_path, self.bucket, key, ExtraArgs=extra_args, Callback=callback)
+        else:
+            client.upload_file(local_path, self.bucket, key, ExtraArgs=extra_args)
         return self._object_etag(client, key) if need_etag else None
 
     def _normalize_prefix(self, s3_path):
@@ -862,6 +925,37 @@ class S3:
     def _log_archive_preflight_progress(self, processed, total, issues):
         if processed and processed % self.PUSH_PROGRESS_INTERVAL == 0:
             logger.info(f"archive preflight: checked={processed}/{total} issue(s)={issues}")
+
+    def _log_archive_build_progress(self, processed, total, archive_path, started):
+        if processed and processed % self.PUSH_PROGRESS_INTERVAL == 0:
+            elapsed = max(time.monotonic() - started, 0.001)
+            rate = processed / elapsed
+            size = self._format_bytes(os.path.getsize(archive_path))
+            logger.info(
+                f"archive build: archived={processed}/{total} size={size} "
+                f"rate={rate:.1f} files/s"
+            )
+
+    def _log_archive_build_complete(self, archive_path, started):
+        elapsed = max(time.monotonic() - started, 0.001)
+        size = self._format_bytes(os.path.getsize(archive_path))
+        logger.info(f"archive build: complete size={size} elapsed={elapsed:.1f}s")
+
+    def _archive_upload_progress_callback(self, local_path, key):
+        return _ArchiveUploadProgress(
+            key,
+            os.path.getsize(local_path),
+            self.ARCHIVE_UPLOAD_PROGRESS_SECONDS,
+            self.ARCHIVE_UPLOAD_PROGRESS_BYTES,
+        )
+
+    @staticmethod
+    def _format_bytes(num_bytes):
+        size = float(num_bytes)
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if size < 1024 or unit == 'GB':
+                return f"{size:.1f} {unit}"
+            size /= 1024
 
     def _log_push_summary(self, total, uploaded, skipped, failures, started):
         elapsed = max(time.monotonic() - started, 0.001)

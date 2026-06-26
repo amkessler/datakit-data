@@ -282,6 +282,42 @@ def test_upload_large_file_skips_head_when_etag_not_needed(mocker):
     mock_client.head_object.assert_not_called()
 
 
+def test_upload_small_file_invokes_callback(mocker, tmpdir):
+    """
+    _upload reports full byte progress for small put_object uploads when a callback is provided.
+    """
+    data_file = os.path.join(str(tmpdir), 'foo.csv')
+    with open(data_file, 'w') as f:
+        f.write('abc')
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_client.put_object.return_value = {'ETag': '"abc123"'}
+    callback = mocker.Mock()
+
+    s3 = S3('ap', 'foo.org')
+    etag = s3._upload(mock_client, data_file, '2017/fake-project/foo.csv', need_etag=True, callback=callback)
+
+    assert etag == 'abc123'
+    callback.assert_called_once_with(3)
+
+
+def test_archive_upload_progress_callback_logs(caplog, tmpdir):
+    """
+    Archive upload progress reports bytes, percent, rate, and elapsed time.
+    """
+    archive_path = os.path.join(str(tmpdir), 'snapshot.zip')
+    with open(archive_path, 'wb') as f:
+        f.write(b'x' * 10)
+
+    s3 = S3('ap', 'foo.org')
+    progress = s3._archive_upload_progress_callback(archive_path, '2017/fake-project/source/snapshot.zip')
+    progress(10)
+
+    assert 'archive upload progress: 2017/fake-project/source/snapshot.zip 10.0 B/10.0 B 100.0%' in caplog.text
+    assert 'rate=' in caplog.text
+    assert 'elapsed=' in caplog.text
+
+
 def test_pull_creates_sync_markers(mocker, tmpdir):
     """S3.pull records the downloaded object's ETag (from the listing) in the .synced marker."""
     data_dir = str(tmpdir.mkdir('data'))
@@ -765,7 +801,7 @@ def test_push_parallel_uploads_use_worker_clients(caplog, mocker, tmpdir):
             client_calls.append(client)
         return client
 
-    def upload_side_effect(client, local_path, key, need_etag):
+    def upload_side_effect(client, local_path, key, need_etag, callback=None):
         barrier.wait(timeout=5)
         return 'etag'
 
@@ -845,7 +881,7 @@ def test_push_parallel_aggregates_upload_failures(caplog, mocker, tmpdir):
     open(os.path.join(data_dir, 'bad.csv'), 'w').close()
     mocker.patch.object(S3, '_client', return_value=object())
 
-    def upload_side_effect(client, local_path, key, need_etag):
+    def upload_side_effect(client, local_path, key, need_etag, callback=None):
         if key.endswith('bad.csv'):
             raise ClientError({'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}}, 'PutObject')
         return 'etag'
@@ -921,7 +957,7 @@ def test_push_archive_uploads_zip_and_manifest(mocker, tmpdir):
     mocker.patch('datakit_data.s3.boto3.Session')
     seen = {}
 
-    def upload_side_effect(client, local_path, key, need_etag):
+    def upload_side_effect(client, local_path, key, need_etag, callback=None):
         if key.endswith('.zip'):
             with zipfile.ZipFile(local_path) as archive:
                 seen['zip_names'] = sorted(archive.namelist())
@@ -948,6 +984,7 @@ def test_push_archive_uploads_zip_and_manifest(mocker, tmpdir):
         'source/snapshot/a.txt',
         'source/snapshot/b.txt',
     ]
+    assert all(call.kwargs['callback'] is not None for call in upload.call_args_list)
 
 
 def test_push_archive_records_archive_managed_path(mocker, tmpdir):
