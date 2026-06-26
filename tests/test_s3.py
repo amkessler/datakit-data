@@ -975,6 +975,59 @@ def test_push_archive_records_archive_managed_path(mocker, tmpdir):
     assert read_archive_paths(sync_dir) == ['source/snapshot']
 
 
+def test_push_archive_reports_preflight_progress(caplog, mocker, tmpdir):
+    """
+    Archive push emits progress during preflight validation.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    os.makedirs(snapshot_dir)
+    for index in range(S3.PUSH_PROGRESS_INTERVAL):
+        open(os.path.join(snapshot_dir, f'{index}.txt'), 'w').close()
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(
+        data_dir,
+        '2017/fake-project',
+        paths=['source/snapshot'],
+        archive=True,
+        extra_flags=['--dryrun'],
+    )
+
+    assert result == 0
+    assert 'archive preflight: validating selected files with 1 worker(s)' in caplog.text
+    assert 'archive preflight: checked=1000/1000 issue(s)=0' in caplog.text
+    assert 'archive preflight: ok' in caplog.text
+    mock_session.assert_not_called()
+
+
+def test_push_archive_preflight_uses_jobs(caplog, mocker, tmpdir):
+    """
+    Archive preflight validation honors the push jobs setting.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    os.makedirs(snapshot_dir)
+    open(os.path.join(snapshot_dir, 'a.txt'), 'w').close()
+    validate = mocker.patch('datakit_data.s3.validate_local_files', return_value=[])
+    mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(
+        data_dir,
+        '2017/fake-project',
+        paths=['source/snapshot'],
+        archive=True,
+        extra_flags=['--dryrun'],
+        jobs=4,
+    )
+
+    assert result == 0
+    assert validate.call_args.kwargs['jobs'] == 4
+    assert 'archive preflight: validating selected files with 4 worker(s)' in caplog.text
+
+
 def test_push_archive_prunes_individual_objects_after_upload(mocker, tmpdir):
     """
     Archive push with prune_individuals deletes old per-file objects after archive upload succeeds.

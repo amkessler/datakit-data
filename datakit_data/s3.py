@@ -334,7 +334,7 @@ class S3:
             logger.info(ARCHIVE_FILTERS_UNSUPPORTED_MSG)
             return 1
         if archive:
-            return self.push_archive(data_dir, s3_path, paths, extra_flags, sync_status_dir, prune_individuals)
+            return self.push_archive(data_dir, s3_path, paths, extra_flags, sync_status_dir, prune_individuals, jobs)
         markers = SyncMarkers(sync_status_dir)
         failures = 0
         logger.info("push discovery: scanning local files")
@@ -434,10 +434,11 @@ class S3:
 
     def push_archive(
         self, data_dir, s3_path='', paths=None, extra_flags=None, sync_status_dir=None,
-        prune_individuals=False
+        prune_individuals=False, jobs=1
     ):
         extra_flags = extra_flags or []
         paths = paths or []
+        jobs = max(1, int(jobs or 1))
         dryrun = '--dryrun' in extra_flags or '--dry-run' in extra_flags
         if len(paths) != 1:
             logger.info(ARCHIVE_REQUIRES_ONE_PATH_MSG)
@@ -453,11 +454,17 @@ class S3:
         archive_root = os.path.join(data_dir, *archive_root_rel.split('/'))
         local_files = list_data_files(data_dir, sync_status_dir=sync_status_dir, paths=paths)
         logger.info(f"archive push: selected {len(local_files)} file(s) under {paths[0]}")
-        issues = validate_local_files(local_files)
+        logger.info(f"archive preflight: validating selected files with {jobs} worker(s)")
+        issues = validate_local_files(
+            local_files,
+            progress_callback=self._log_archive_preflight_progress,
+            jobs=jobs,
+        )
         if issues:
             for issue in issues:
                 logger.info(f"preflight error: {issue.path}: {issue.message}")
             return len(issues)
+        logger.info("archive preflight: ok")
         logger.info(f"archive upload: {archive_rel} to s3://{self.bucket}/{archive_key}")
         logger.info(f"archive upload: {manifest_rel} to s3://{self.bucket}/{manifest_key}")
         if dryrun:
@@ -851,6 +858,10 @@ class S3:
     def _log_preflight_progress(self, processed, total, issues):
         if processed and processed % self.PUSH_PROGRESS_INTERVAL == 0:
             logger.info(f"push preflight: checked={processed}/{total} issue(s)={issues}")
+
+    def _log_archive_preflight_progress(self, processed, total, issues):
+        if processed and processed % self.PUSH_PROGRESS_INTERVAL == 0:
+            logger.info(f"archive preflight: checked={processed}/{total} issue(s)={issues}")
 
     def _log_push_summary(self, total, uploaded, skipped, failures, started):
         elapsed = max(time.monotonic() - started, 0.001)
