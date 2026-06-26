@@ -433,7 +433,7 @@ def test_push_include_and_exclude_patterns(mocker, tmpdir):
     assert upload_keys == {'2017/fake-project/source/keep.csv'}
 
 
-def test_push_parallel_uploads_use_worker_clients(mocker, tmpdir):
+def test_push_parallel_uploads_use_worker_clients(caplog, mocker, tmpdir):
     """
     S3.push creates worker-local boto3 clients when parallel uploads are requested.
     """
@@ -464,6 +464,7 @@ def test_push_parallel_uploads_use_worker_clients(mocker, tmpdir):
     assert result == 0
     assert len(client_calls) == 2
     assert {call.args[0] for call in upload.call_args_list} == set(clients)
+    assert 'push upload: uploading 2 file(s) with 2 worker(s)' in caplog.text
 
 
 def test_push_parallelizes_skip_decisions_for_dryrun(caplog, mocker, tmpdir):
@@ -592,7 +593,7 @@ def test_push_preflight_only_checks_selected_paths(mocker, tmpdir):
     assert upload.call_args.args[2] == '2017/fake-project/source/current/foo.csv'
 
 
-def test_push_dryrun(mocker):
+def test_push_dryrun(caplog, mocker):
     """
     S3.push with --dryrun logs intended uploads without transferring anything.
     """
@@ -603,6 +604,7 @@ def test_push_dryrun(mocker):
     s3 = S3('ap', 'foo.org')
     s3.push('data/', '2017/fake-project', extra_flags=['--dryrun'])
 
+    assert 'upload: data/foo to s3://foo.org/2017/fake-project/foo' in caplog.text
     mock_client.put_object.assert_not_called()
     mock_client.upload_file.assert_not_called()
 
@@ -874,7 +876,7 @@ def test_pull_client_error(caplog, mocker):
 
 def test_push_logging(caplog, mocker):
     """
-    S3.push logs an 'upload:' line for each file transferred.
+    S3.push logs phase and summary lines without per-file upload output by default.
     """
     mocker.patch('datakit_data.s3.list_local_files', return_value={
         'foo': 'data/foo', 'bar': 'data/bar'
@@ -885,13 +887,28 @@ def test_push_logging(caplog, mocker):
     s3 = S3('ap', 'foo.org')
     s3.push('data/', '2017/fake-project')
 
-    assert 'upload: data/foo to s3://foo.org/2017/fake-project/foo' in caplog.text
-    assert 'upload: data/bar to s3://foo.org/2017/fake-project/bar' in caplog.text
+    assert 'upload: data/foo to s3://foo.org/2017/fake-project/foo' not in caplog.text
+    assert 'upload: data/bar to s3://foo.org/2017/fake-project/bar' not in caplog.text
     assert 'push discovery: scanning local files' in caplog.text
     assert 'push discovery: selected 2 file(s)' in caplog.text
     assert 'push preflight: validating selected files with 1 worker(s)' in caplog.text
     assert 'push preflight: ok' in caplog.text
     assert 'push summary: selected=2 uploaded=2 skipped=0 failed=0' in caplog.text
+
+
+def test_push_verbose_logs_uploads(caplog, mocker):
+    """
+    S3.push logs per-file upload output in verbose mode.
+    """
+    mocker.patch('datakit_data.s3.list_local_files', return_value={'foo': 'data/foo'})
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push('data/', '2017/fake-project', extra_flags=['--verbose'])
+
+    assert result == 0
+    assert 'upload: data/foo to s3://foo.org/2017/fake-project/foo' in caplog.text
 
 
 def test_push_preflight_logs_progress(caplog, mocker):

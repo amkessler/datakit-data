@@ -235,8 +235,9 @@ To further restrict candidates by relative path globs::
 For safety, filtered pushes cannot be combined with `delete`; run an unfiltered delete separately if
 you intend to prune the entire configured S3 path.
 
-By default, `push` no longer logs one line for every skipped file. Use `--verbose` to restore
-per-file skipped output::
+By default, real `push` runs report progress and summary counters instead of logging every skipped
+or uploaded file. Dry runs still print planned uploads. Use `--verbose` to restore per-file skipped
+and uploaded output during real pushes::
 
   $ datakit data push --verbose
 

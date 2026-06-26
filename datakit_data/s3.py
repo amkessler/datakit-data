@@ -239,7 +239,8 @@ class S3:
                     logger.info(f"skipped: {decision.local_path}")
                 self._log_push_progress(processed, total, uploaded, skipped, failures, started)
                 continue
-            logger.info(f"upload: {decision.local_path} to s3://{self.bucket}/{decision.key}")
+            if dryrun or verbose:
+                logger.info(f"upload: {decision.local_path} to s3://{self.bucket}/{decision.key}")
             if jobs > 1 and not dryrun:
                 upload_items.append((decision.rel_path, decision.local_path, decision.key))
             else:
@@ -255,6 +256,7 @@ class S3:
                 processed += 1
                 self._log_push_progress(processed, total, uploaded, skipped, failures, started)
         if upload_items:
+            logger.info(f"push upload: uploading {len(upload_items)} file(s) with {jobs} worker(s)")
             thread_clients = threading.local()
             with ThreadPoolExecutor(max_workers=jobs) as executor:
                 futures = [
