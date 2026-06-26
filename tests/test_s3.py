@@ -5,7 +5,7 @@ import threading
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 
-from datakit_data.s3 import S3, S3ObjectInfo, list_local_files
+from datakit_data.s3 import S3, S3ObjectInfo, list_local_files, validate_local_file
 from datakit_data.sync_markers import SyncMarkers
 
 
@@ -832,7 +832,65 @@ def test_push_logging(caplog, mocker):
 
     assert 'upload: data/foo to s3://foo.org/2017/fake-project/foo' in caplog.text
     assert 'upload: data/bar to s3://foo.org/2017/fake-project/bar' in caplog.text
+    assert 'push discovery: scanning local files' in caplog.text
+    assert 'push discovery: selected 2 file(s)' in caplog.text
+    assert 'push preflight: validating selected files with 1 worker(s)' in caplog.text
+    assert 'push preflight: ok' in caplog.text
     assert 'push summary: selected=2 uploaded=2 skipped=0 failed=0' in caplog.text
+
+
+def test_push_preflight_logs_progress(caplog, mocker):
+    """
+    S3.push logs periodic progress while validating large selected file sets.
+    """
+    local_files = {
+        f'file_{index}.csv': f'data/file_{index}.csv'
+        for index in range(S3.PUSH_PROGRESS_INTERVAL + 1)
+    }
+
+    def validate_side_effect(files, progress_callback=None, jobs=1):
+        for index in range(1, len(files) + 1):
+            progress_callback(index, len(files), 0)
+        return []
+
+    mocker.patch('datakit_data.s3.list_local_files', return_value=local_files)
+    mocker.patch('datakit_data.s3.validate_local_files', side_effect=validate_side_effect)
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push('data/', '2017/fake-project')
+
+    assert result == 0
+    assert f'push preflight: checked={S3.PUSH_PROGRESS_INTERVAL}/{len(local_files)} issue(s)=0' in caplog.text
+
+
+def test_push_preflight_uses_jobs(mocker, tmpdir):
+    """
+    S3.push validates selected files concurrently when jobs > 1.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    open(os.path.join(data_dir, 'foo.csv'), 'w').close()
+    open(os.path.join(data_dir, 'bar.csv'), 'w').close()
+    barrier = threading.Barrier(2)
+    thread_ids = set()
+    thread_lock = threading.Lock()
+
+    def validate_side_effect(local_path):
+        with thread_lock:
+            thread_ids.add(threading.get_ident())
+        barrier.wait(timeout=5)
+        return validate_local_file(local_path)
+
+    mocker.patch('datakit_data.s3.validate_local_file', side_effect=validate_side_effect)
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', jobs=2)
+
+    assert result == 0
+    assert len(thread_ids) == 2
 
 
 def test_pull_logging(caplog, mocker):

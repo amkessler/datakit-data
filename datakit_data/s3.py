@@ -122,21 +122,41 @@ def list_local_files(data_dir, paths=None, include_patterns=None, exclude_patter
     return files
 
 
-def validate_local_files(local_files):
+def validate_local_file(local_path):
+    try:
+        if os.path.islink(local_path) and not os.path.exists(local_path):
+            return LocalFileIssue(local_path, 'broken symlink')
+        if os.path.exists(local_path) and not os.path.isfile(local_path):
+            return LocalFileIssue(local_path, 'not a regular file')
+        if os.path.exists(local_path):
+            with open(local_path, 'rb'):
+                pass
+    except OSError as e:
+        return LocalFileIssue(local_path, str(e))
+    return None
+
+
+def validate_local_files(local_files, progress_callback=None, jobs=1):
     issues = []
-    for _, local_path in sorted(local_files.items()):
-        try:
-            if os.path.islink(local_path) and not os.path.exists(local_path):
-                issues.append(LocalFileIssue(local_path, 'broken symlink'))
-                continue
-            if os.path.exists(local_path) and not os.path.isfile(local_path):
-                issues.append(LocalFileIssue(local_path, 'not a regular file'))
-                continue
-            if os.path.exists(local_path):
-                with open(local_path, 'rb'):
-                    pass
-        except OSError as e:
-            issues.append(LocalFileIssue(local_path, str(e)))
+    sorted_paths = [local_path for _, local_path in sorted(local_files.items())]
+    total = len(sorted_paths)
+    jobs = max(1, int(jobs or 1))
+    if jobs == 1:
+        for index, local_path in enumerate(sorted_paths, start=1):
+            issue = validate_local_file(local_path)
+            if issue:
+                issues.append(issue)
+            if progress_callback:
+                progress_callback(index, total, len(issues))
+        return issues
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = [executor.submit(validate_local_file, local_path) for local_path in sorted_paths]
+        for index, future in enumerate(as_completed(futures), start=1):
+            issue = future.result()
+            if issue:
+                issues.append(issue)
+            if progress_callback:
+                progress_callback(index, total, len(issues))
     return issues
 
 
@@ -178,6 +198,7 @@ class S3:
             return 1
         markers = SyncMarkers(sync_status_dir)
         failures = 0
+        logger.info("push discovery: scanning local files")
         local_files = list_local_files(
             data_dir,
             paths=paths,
@@ -186,10 +207,16 @@ class S3:
         )
         started = time.monotonic()
         total = len(local_files)
+        logger.info(f"push discovery: selected {total} file(s)")
         processed = 0
         uploaded = 0
         skipped = 0
-        preflight_issues = validate_local_files(local_files)
+        logger.info(f"push preflight: validating selected files with {jobs} worker(s)")
+        preflight_issues = validate_local_files(
+            local_files,
+            progress_callback=self._log_preflight_progress,
+            jobs=jobs,
+        )
         if preflight_issues:
             for issue in preflight_issues:
                 logger.info(f"preflight error: {issue.path}: {issue.message}")
@@ -197,6 +224,7 @@ class S3:
             logger.info(f"{failures} file(s) failed preflight validation")
             self._log_push_summary(total, uploaded, skipped, failures, started)
             return failures
+        logger.info("push preflight: ok")
         client = self._client() if jobs == 1 and not dryrun else None
         upload_items = []
         for rel_path, local_path in sorted(local_files.items()):
@@ -392,6 +420,10 @@ class S3:
                 f"push progress: processed={processed}/{total} uploaded={uploaded} "
                 f"skipped={skipped} failed={failures} rate={rate:.1f} files/s"
             )
+
+    def _log_preflight_progress(self, processed, total, issues):
+        if processed and processed % self.PUSH_PROGRESS_INTERVAL == 0:
+            logger.info(f"push preflight: checked={processed}/{total} issue(s)={issues}")
 
     def _log_push_summary(self, total, uploaded, skipped, failures, started):
         elapsed = max(time.monotonic() - started, 0.001)
