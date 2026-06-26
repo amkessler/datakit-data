@@ -1100,7 +1100,7 @@ def test_push_archive_prunes_individual_objects_after_upload(mocker, tmpdir):
     delete_keys.assert_called_once_with(mock_client, [
         '2017/fake-project/source/snapshot/a.txt',
         '2017/fake-project/source/snapshot/stale.txt',
-    ])
+    ], progress_label='archive prune')
     assert read_archive_paths(sync_dir) == ['source/snapshot']
 
 
@@ -1519,6 +1519,39 @@ def test_push_delete_partial_error(caplog, mocker):
 
     assert result == 1
     assert '2017/fake-project/stale2' in caplog.text
+
+
+def test_delete_keys_reports_progress(caplog, mocker):
+    """
+    _delete_keys emits progress when a progress label is supplied.
+    """
+    mock_client = mocker.Mock()
+    mock_client.delete_objects.return_value = {'Deleted': []}
+    keys = [f'2017/fake-project/stale-{index}' for index in range(1001)]
+
+    s3 = S3('ap', 'foo.org')
+    result = s3._delete_keys(mock_client, keys, progress_label='archive prune')
+
+    assert result == 0
+    assert mock_client.delete_objects.call_count == 2
+    assert 'archive prune: deleted=1000/1001 failed=0' in caplog.text
+    assert 'archive prune: deleted=1001/1001 failed=0' in caplog.text
+
+
+def test_delete_keys_progress_includes_failures(caplog, mocker):
+    """
+    Delete progress reports accumulated failures.
+    """
+    mock_client = mocker.Mock()
+    mock_client.delete_objects.return_value = {
+        'Errors': [{'Key': '2017/fake-project/stale', 'Message': 'Access Denied'}],
+    }
+
+    s3 = S3('ap', 'foo.org')
+    result = s3._delete_keys(mock_client, ['2017/fake-project/stale'], progress_label='archive prune')
+
+    assert result == 1
+    assert 'archive prune: deleted=1/1 failed=1' in caplog.text
 
 
 def test_push_delete_empty_path_refused(caplog, mocker):

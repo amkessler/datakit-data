@@ -579,7 +579,7 @@ class S3:
         )
         for key in to_delete:
             logger.info(f"delete: s3://{self.bucket}/{key}")
-        return self._delete_keys(client, to_delete)
+        return self._delete_keys(client, to_delete, progress_label='archive prune')
 
     def _iter_push_decisions(self, local_files, markers, prefix, force, jobs):
         items = sorted(local_files.items())
@@ -965,9 +965,12 @@ class S3:
             f"failed={failures} elapsed={elapsed:.1f}s rate={rate:.1f} files/s"
         )
 
-    def _delete_keys(self, client, keys):
+    def _delete_keys(self, client, keys, progress_label=None):
         # delete_objects removes up to 1000 keys per request; batch accordingly.
         failures = 0
+        total = len(keys)
+        processed = 0
+        started = time.monotonic()
         for start in range(0, len(keys), 1000):
             batch = keys[start:start + 1000]
             try:
@@ -978,11 +981,25 @@ class S3:
             except (ClientError, BotoCoreError) as e:
                 failures += len(batch)
                 logger.info(f"\n*** Error ***\n{e}\n")
+                processed += len(batch)
+                self._log_delete_progress(progress_label, processed, total, failures, started)
                 continue
             for error in response.get('Errors', []):
                 failures += 1
                 logger.info(f"\n*** Error ***\n{error.get('Key')}: {error.get('Message')}\n")
+            processed += len(batch)
+            self._log_delete_progress(progress_label, processed, total, failures, started)
         return failures
+
+    def _log_delete_progress(self, progress_label, processed, total, failures, started):
+        if not progress_label:
+            return
+        elapsed = max(time.monotonic() - started, 0.001)
+        rate = processed / elapsed
+        logger.info(
+            f"{progress_label}: deleted={processed}/{total} failed={failures} "
+            f"rate={rate:.1f} objects/s elapsed={elapsed:.1f}s"
+        )
 
     def _is_directory_marker(self, key, prefix):
         rel_path = key[len(prefix):]
