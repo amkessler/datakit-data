@@ -25,6 +25,10 @@ S3ObjectInfo = namedtuple('S3ObjectInfo', ['etag'])
 # Local filesystem issue found before transfer starts.
 LocalFileIssue = namedtuple('LocalFileIssue', ['path', 'message'])
 
+# A per-file push decision made after preflight: skipped=True means the sync marker says
+# the local file is already current; otherwise the file should be uploaded or reported in dryrun.
+PushDecision = namedtuple('PushDecision', ['rel_path', 'local_path', 'key', 'skipped'])
+
 # The result of S3.compare: sorted lists of rel_paths bucketed by how the local copy, the live
 # remote object, and the recorded .synced marker disagree. 'differ' holds files present on both
 # sides whose difference cannot be attributed for lack of a usable sync record.
@@ -227,22 +231,21 @@ class S3:
         logger.info("push preflight: ok")
         client = self._client() if jobs == 1 and not dryrun else None
         upload_items = []
-        for rel_path, local_path in sorted(local_files.items()):
-            key = prefix + rel_path
-            if not force and markers.is_fresh(rel_path, local_path):
+        for decision in self._iter_push_decisions(local_files, markers, prefix, force, jobs):
+            if decision.skipped:
                 skipped += 1
                 processed += 1
                 if verbose:
-                    logger.info(f"skipped: {local_path}")
+                    logger.info(f"skipped: {decision.local_path}")
                 self._log_push_progress(processed, total, uploaded, skipped, failures, started)
                 continue
-            logger.info(f"upload: {local_path} to s3://{self.bucket}/{key}")
+            logger.info(f"upload: {decision.local_path} to s3://{self.bucket}/{decision.key}")
             if jobs > 1 and not dryrun:
-                upload_items.append((rel_path, local_path, key))
+                upload_items.append((decision.rel_path, decision.local_path, decision.key))
             else:
                 if not dryrun:
                     try:
-                        self._upload_and_mark(client, rel_path, local_path, key, markers)
+                        self._upload_and_mark(client, decision.rel_path, decision.local_path, decision.key, markers)
                         uploaded += 1
                     except (ClientError, BotoCoreError, OSError) as e:
                         failures += 1
@@ -281,6 +284,27 @@ class S3:
                 failures += self._delete_keys(client, to_delete)
         self._log_push_summary(total, uploaded, skipped, failures, started)
         return failures
+
+    def _iter_push_decisions(self, local_files, markers, prefix, force, jobs):
+        items = sorted(local_files.items())
+        if jobs == 1:
+            for item in items:
+                yield self._push_decision(markers, prefix, force, item)
+            return
+        logger.info(f"push decision: checking selected files with {jobs} worker(s)")
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = [
+                executor.submit(self._push_decision, markers, prefix, force, item)
+                for item in items
+            ]
+            for future in futures:
+                yield future.result()
+
+    def _push_decision(self, markers, prefix, force, item):
+        rel_path, local_path = item
+        key = prefix + rel_path
+        skipped = not force and markers.is_fresh(rel_path, local_path)
+        return PushDecision(rel_path, local_path, key, skipped)
 
     def _upload_and_mark(self, client, rel_path, local_path, key, markers):
         etag = self._upload(client, local_path, key, markers.enabled)

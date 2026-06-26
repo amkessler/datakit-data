@@ -466,6 +466,61 @@ def test_push_parallel_uploads_use_worker_clients(mocker, tmpdir):
     assert {call.args[0] for call in upload.call_args_list} == set(clients)
 
 
+def test_push_parallelizes_skip_decisions_for_dryrun(caplog, mocker, tmpdir):
+    """
+    S3.push uses jobs for the marker freshness decision phase, including dryrun.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    open(os.path.join(data_dir, 'foo.csv'), 'w').close()
+    open(os.path.join(data_dir, 'bar.csv'), 'w').close()
+    barrier = threading.Barrier(2)
+    thread_ids = set()
+    thread_lock = threading.Lock()
+
+    def is_fresh_side_effect(markers, rel_path, local_path):
+        with thread_lock:
+            thread_ids.add(threading.get_ident())
+        barrier.wait(timeout=5)
+        return True
+
+    mocker.patch('datakit_data.s3.validate_local_files', return_value=[])
+    mocker.patch.object(SyncMarkers, 'is_fresh', autospec=True, side_effect=is_fresh_side_effect)
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    upload = mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', extra_flags=['--dryrun'], jobs=2)
+
+    assert result == 0
+    assert len(thread_ids) == 2
+    assert 'push decision: checking selected files with 2 worker(s)' in caplog.text
+    assert 'push summary: selected=2 uploaded=0 skipped=2 failed=0' in caplog.text
+    mock_session.assert_not_called()
+    upload.assert_not_called()
+
+
+def test_push_parallel_decisions_preserve_sorted_output(caplog, mocker, tmpdir):
+    """
+    Parallel push decisions are yielded in sorted path order, keeping dryrun output stable.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    open(os.path.join(data_dir, 'b.csv'), 'w').close()
+    open(os.path.join(data_dir, 'a.csv'), 'w').close()
+    mocker.patch('datakit_data.s3.validate_local_files', return_value=[])
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mocker.patch.object(SyncMarkers, 'is_fresh', return_value=False)
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', extra_flags=['--dryrun'], jobs=2)
+
+    assert result == 0
+    first = caplog.text.find('upload: ' + os.path.join(data_dir, 'a.csv'))
+    second = caplog.text.find('upload: ' + os.path.join(data_dir, 'b.csv'))
+    assert first != -1
+    assert second != -1
+    assert first < second
+
+
 def test_push_parallel_aggregates_upload_failures(caplog, mocker, tmpdir):
     """
     S3.push counts upload failures raised by parallel workers.
