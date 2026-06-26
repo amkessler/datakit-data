@@ -66,6 +66,9 @@ def test_get_parser():
     args = parser.parse_args([])
     assert hasattr(args, 'args')
     assert hasattr(args, 'force')
+    assert hasattr(args, 'archive')
+    assert hasattr(args, 'path')
+    assert hasattr(args, 'expand_archives')
 
 
 def test_boolean_cli_flags(mocker):
@@ -108,6 +111,54 @@ def test_force_option_forwarded(mocker):
         '2017/fake-project',
         extra_flags=['--force'],
         sync_status_dir=None
+    )
+
+
+def test_archive_option_forwarded(mocker):
+    """
+    --archive and --path are parsed and forwarded to S3.pull.
+    """
+    pull_mock = mocker.patch(
+        'datakit_data.commands.pull.S3.pull',
+        autospec=True,
+    )
+    pull_mock.return_value = 0
+    cmd = Pull(mock.Mock(), None, 'data pull')
+    parsed_args = cmd.get_parser('data pull').parse_args([
+        '--archive',
+        '--path', 'data/source/snapshot',
+    ])
+    cmd.run(parsed_args)
+    pull_mock.assert_any_call(
+        mock.ANY,
+        'data/',
+        '2017/fake-project',
+        extra_flags=[],
+        sync_status_dir=None,
+        paths=['data/source/snapshot'],
+        archive=True,
+    )
+
+
+def test_expand_archives_option_forwarded(mocker):
+    """
+    --expand-archives is parsed and forwarded to S3.pull.
+    """
+    pull_mock = mocker.patch(
+        'datakit_data.commands.pull.S3.pull',
+        autospec=True,
+    )
+    pull_mock.return_value = 0
+    cmd = Pull(mock.Mock(), None, 'data pull')
+    parsed_args = cmd.get_parser('data pull').parse_args(['--expand-archives'])
+    cmd.run(parsed_args)
+    pull_mock.assert_any_call(
+        mock.ANY,
+        'data/',
+        '2017/fake-project',
+        extra_flags=[],
+        sync_status_dir=None,
+        expand_archives=True,
     )
 
 

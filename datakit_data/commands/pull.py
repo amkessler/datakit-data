@@ -8,6 +8,11 @@ from ..project_mixin import ProjectMixin
 from ..s3 import S3
 
 
+def _parsed_list(parsed_args, name):
+    value = getattr(parsed_args, name, None)
+    return value if isinstance(value, list) else []
+
+
 class Pull(ProjectMixin, CommandHelpers, Command):
 
     "Pull data from S3"
@@ -24,6 +29,24 @@ class Pull(ProjectMixin, CommandHelpers, Command):
             action='store_true',
             default=False,
             help="Pull every S3 object, ignoring sync status checks"
+        )
+        parser.add_argument(
+            '--archive',
+            action='store_true',
+            default=False,
+            help="Restore one archived snapshot selected by --path"
+        )
+        parser.add_argument(
+            '--path',
+            action='append',
+            default=[],
+            help="Archive path to restore. Required with --archive."
+        )
+        parser.add_argument(
+            '--expand-archives',
+            action='store_true',
+            default=False,
+            help="After pulling, extract downloaded local archive files with matching manifests"
         )
         return parser
 
@@ -44,11 +67,21 @@ class Pull(ProjectMixin, CommandHelpers, Command):
         if unsupported:
             self.log.info(f"Ignoring unsupported flag(s): {', '.join(unsupported)}")
         sync_status_dir = self.project_configs.get('sync_status_location')
+        pull_kwargs = {
+            'extra_flags': clean_flags,
+            'sync_status_dir': sync_status_dir,
+        }
+        paths = _parsed_list(parsed_args, 'path')
+        if paths:
+            pull_kwargs['paths'] = paths
+        if getattr(parsed_args, 'archive', False) is True:
+            pull_kwargs['archive'] = True
+        if getattr(parsed_args, 'expand_archives', False) is True:
+            pull_kwargs['expand_archives'] = True
         failures = s3.pull(
             'data/',
             self.project_configs['s3_path'],
-            extra_flags=clean_flags,
-            sync_status_dir=sync_status_dir
+            **pull_kwargs
         )
         if failures:
             self.log.info(f"{failures} file(s) failed to transfer")

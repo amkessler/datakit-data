@@ -1,11 +1,14 @@
 import os
 import time
 import threading
+import json
+import zipfile
+import hashlib
 
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 
-from datakit_data.s3 import S3, S3ObjectInfo, list_local_files, validate_local_file
+from datakit_data.s3 import S3, S3ObjectInfo, list_local_files, read_archive_paths, validate_local_file
 from datakit_data.sync_markers import SyncMarkers
 
 
@@ -351,6 +354,259 @@ def test_pull_downloads_when_etag_differs(mocker, tmpdir):
         assert f.read() == 'new-etag'
 
 
+def test_pull_archive_downloads_and_extracts(mocker, tmpdir):
+    """
+    S3.pull archive mode downloads the manifest/archive pair and extracts the archive.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mocker.patch.object(S3, '_object_etag', return_value='etag')
+
+    def download_side_effect(bucket, key, local_path):
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        if key.endswith('.zip'):
+            with zipfile.ZipFile(local_path, 'w') as archive:
+                archive.writestr('source/snapshot/a.txt', 'alpha')
+        else:
+            with open(local_path, 'w') as f:
+                json.dump({'archive_path': 'source/snapshot.zip', 'root_path': 'source/snapshot'}, f)
+
+    mock_client.download_file.side_effect = download_side_effect
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(
+        data_dir,
+        '2017/fake-project',
+        archive=True,
+        paths=['data/source/snapshot'],
+        sync_status_dir=sync_dir,
+    )
+
+    assert result == 0
+    assert mock_client.download_file.call_args_list[0].args[:2] == (
+        'foo.org',
+        '2017/fake-project/source/snapshot.manifest.json',
+    )
+    assert mock_client.download_file.call_args_list[1].args[:2] == (
+        'foo.org',
+        '2017/fake-project/source/snapshot.zip',
+    )
+    with open(os.path.join(data_dir, 'source', 'snapshot', 'a.txt')) as f:
+        assert f.read() == 'alpha'
+    assert read_archive_paths(sync_dir) == ['source/snapshot']
+
+
+def test_pull_archive_rejects_checksum_mismatch(caplog, mocker, tmpdir):
+    """
+    Archive pull validates the downloaded archive against the downloaded manifest.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mocker.patch.object(S3, '_object_etag', return_value='etag')
+
+    def download_side_effect(bucket, key, local_path):
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        if key.endswith('.zip'):
+            with zipfile.ZipFile(local_path, 'w') as archive:
+                archive.writestr('source/snapshot/a.txt', 'alpha')
+        else:
+            with open(local_path, 'w') as f:
+                json.dump({
+                    'archive_path': 'source/snapshot.zip',
+                    'archive_sha256': 'not-the-real-checksum',
+                    'root_path': 'source/snapshot',
+                }, f)
+
+    mock_client.download_file.side_effect = download_side_effect
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(
+        data_dir,
+        '2017/fake-project',
+        archive=True,
+        paths=['data/source/snapshot'],
+        sync_status_dir=sync_dir,
+    )
+
+    assert result == 1
+    assert 'Archive checksum does not match manifest' in caplog.text
+    assert not os.path.exists(os.path.join(data_dir, 'source', 'snapshot', 'a.txt'))
+    assert read_archive_paths(sync_dir) == []
+
+
+def test_pull_archive_dryrun_does_not_download_or_extract(caplog, mocker):
+    """
+    Archive pull dryrun reports downloads and extraction without touching S3.
+    """
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(
+        'data/',
+        '2017/fake-project',
+        extra_flags=['--dryrun'],
+        archive=True,
+        paths=['source/snapshot'],
+    )
+
+    assert result == 0
+    assert 'download: s3://foo.org/2017/fake-project/source/snapshot.manifest.json' in caplog.text
+    assert 'download: s3://foo.org/2017/fake-project/source/snapshot.zip' in caplog.text
+    assert 'extract archive: data/source/snapshot.zip to data/' in caplog.text
+    mock_client.download_file.assert_not_called()
+
+
+def test_pull_expand_archives_extracts_local_archives(mocker, tmpdir):
+    """
+    Regular pull with expand_archives extracts local archive files that have matching manifests.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    archive_path = os.path.join(data_dir, 'source', 'snapshot.zip')
+    manifest_path = os.path.join(data_dir, 'source', 'snapshot.manifest.json')
+    os.makedirs(os.path.dirname(archive_path))
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('source/snapshot/a.txt', 'alpha')
+    with open(manifest_path, 'w') as f:
+        json.dump({'archive_path': 'source/snapshot.zip', 'root_path': 'source/snapshot'}, f)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project', expand_archives=True, sync_status_dir=sync_dir)
+
+    assert result == 0
+    with open(os.path.join(data_dir, 'source', 'snapshot', 'a.txt')) as f:
+        assert f.read() == 'alpha'
+    assert read_archive_paths(sync_dir) == ['source/snapshot']
+
+
+def test_pull_expand_archives_rejects_checksum_mismatch(caplog, mocker, tmpdir):
+    """
+    expand_archives validates local archive files against their manifests before extraction.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    archive_path = os.path.join(data_dir, 'source', 'snapshot.zip')
+    manifest_path = os.path.join(data_dir, 'source', 'snapshot.manifest.json')
+    os.makedirs(os.path.dirname(archive_path))
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('source/snapshot/a.txt', 'alpha')
+    with open(manifest_path, 'w') as f:
+        json.dump({
+            'archive_path': 'source/snapshot.zip',
+            'archive_sha256': 'not-the-real-checksum',
+            'root_path': 'source/snapshot',
+        }, f)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project', expand_archives=True, sync_status_dir=sync_dir)
+
+    assert result == 1
+    assert 'Archive checksum does not match manifest' in caplog.text
+    assert not os.path.exists(os.path.join(data_dir, 'source', 'snapshot', 'a.txt'))
+    assert read_archive_paths(sync_dir) == []
+
+
+def test_extract_archive_rejects_paths_outside_data(caplog, tmpdir):
+    """
+    Archive extraction refuses zip members that would write outside data_dir.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    archive_path = os.path.join(str(tmpdir), 'bad.zip')
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('../outside.txt', 'nope')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3._extract_archive(archive_path, data_dir)
+
+    assert result == 1
+    assert 'escapes data dir' in caplog.text
+    assert not os.path.exists(os.path.join(str(tmpdir), 'outside.txt'))
+
+
+def test_extract_archive_rejects_manifest_archive_mismatch(caplog, tmpdir):
+    """
+    Archive extraction refuses a manifest that points at a different archive object.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    archive_path = os.path.join(str(tmpdir), 'snapshot.zip')
+    manifest_path = os.path.join(str(tmpdir), 'snapshot.manifest.json')
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('source/snapshot/a.txt', 'alpha')
+    with open(manifest_path, 'w') as f:
+        json.dump({'archive_path': 'source/other.zip', 'root_path': 'source/snapshot'}, f)
+
+    s3 = S3('ap', 'foo.org')
+    result = s3._extract_archive(archive_path, data_dir, manifest_path)
+
+    assert result == 1
+    assert 'Archive path does not match manifest' in caplog.text
+    assert not os.path.exists(os.path.join(data_dir, 'source', 'snapshot', 'a.txt'))
+
+
+def test_extract_archive_rejects_checksum_mismatch(caplog, tmpdir):
+    """
+    Archive extraction refuses an archive whose checksum differs from its manifest.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    archive_path = os.path.join(str(tmpdir), 'snapshot.zip')
+    manifest_path = os.path.join(str(tmpdir), 'snapshot.manifest.json')
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('source/snapshot/a.txt', 'alpha')
+    with open(manifest_path, 'w') as f:
+        json.dump({
+            'archive_path': 'source/snapshot.zip',
+            'archive_sha256': 'not-the-real-checksum',
+            'root_path': 'source/snapshot',
+        }, f)
+
+    s3 = S3('ap', 'foo.org')
+    result = s3._extract_archive(archive_path, data_dir, manifest_path)
+
+    assert result == 1
+    assert 'Archive checksum does not match manifest' in caplog.text
+    assert not os.path.exists(os.path.join(data_dir, 'source', 'snapshot', 'a.txt'))
+
+
+def test_extract_archive_refuses_to_overwrite_existing_files(caplog, tmpdir):
+    """
+    Archive extraction refuses to overwrite existing local files.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    existing_path = os.path.join(data_dir, 'source', 'snapshot', 'a.txt')
+    os.makedirs(os.path.dirname(existing_path))
+    with open(existing_path, 'w') as f:
+        f.write('local edit')
+    archive_path = os.path.join(str(tmpdir), 'snapshot.zip')
+    manifest_path = os.path.join(str(tmpdir), 'snapshot.manifest.json')
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('source/snapshot/a.txt', 'remote copy')
+    with open(archive_path, 'rb') as f:
+        checksum = hashlib.sha256(f.read()).hexdigest()
+    with open(manifest_path, 'w') as f:
+        json.dump({
+            'archive_path': 'source/snapshot.zip',
+            'archive_sha256': checksum,
+            'root_path': 'source/snapshot',
+        }, f)
+
+    s3 = S3('ap', 'foo.org')
+    result = s3._extract_archive(archive_path, data_dir, manifest_path)
+
+    assert result == 1
+    assert 'Archive extraction would overwrite existing path' in caplog.text
+    with open(existing_path) as f:
+        assert f.read() == 'local edit'
+
+
 def test_push_skips_synced_files(mocker, tmpdir):
     """
     S3.push does not upload .synced marker files to S3.
@@ -593,6 +849,115 @@ def test_push_preflight_only_checks_selected_paths(mocker, tmpdir):
     assert upload.call_args.args[2] == '2017/fake-project/source/current/foo.csv'
 
 
+def test_push_archive_uploads_zip_and_manifest(mocker, tmpdir):
+    """
+    S3.push archive mode creates one zip archive plus a manifest for the selected path.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    os.makedirs(snapshot_dir)
+    with open(os.path.join(snapshot_dir, 'a.txt'), 'w') as f:
+        f.write('alpha')
+    with open(os.path.join(snapshot_dir, 'b.txt'), 'w') as f:
+        f.write('bravo')
+    mocker.patch('datakit_data.s3.boto3.Session')
+    seen = {}
+
+    def upload_side_effect(client, local_path, key, need_etag):
+        if key.endswith('.zip'):
+            with zipfile.ZipFile(local_path) as archive:
+                seen['zip_names'] = sorted(archive.namelist())
+        if key.endswith('.manifest.json'):
+            with open(local_path) as f:
+                seen['manifest'] = json.load(f)
+        return key + '-etag'
+
+    upload = mocker.patch.object(S3, '_upload', side_effect=upload_side_effect)
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', paths=['data/source/snapshot'], archive=True)
+
+    assert result == 0
+    assert [call.args[2] for call in upload.call_args_list] == [
+        '2017/fake-project/source/snapshot.zip',
+        '2017/fake-project/source/snapshot.manifest.json',
+    ]
+    assert seen['zip_names'] == ['source/snapshot/a.txt', 'source/snapshot/b.txt']
+    assert seen['manifest']['archive_type'] == 'zip'
+    assert seen['manifest']['archive_path'] == 'source/snapshot.zip'
+    assert seen['manifest']['root_path'] == 'source/snapshot'
+    assert [item['path'] for item in seen['manifest']['files']] == [
+        'source/snapshot/a.txt',
+        'source/snapshot/b.txt',
+    ]
+
+
+def test_push_archive_records_archive_managed_path(mocker, tmpdir):
+    """
+    Successful archive pushes register the selected subtree as archive-managed.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    os.makedirs(snapshot_dir)
+    open(os.path.join(snapshot_dir, 'a.txt'), 'w').close()
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(
+        data_dir,
+        '2017/fake-project',
+        paths=['source/snapshot'],
+        archive=True,
+        sync_status_dir=sync_dir,
+    )
+
+    assert result == 0
+    assert read_archive_paths(sync_dir) == ['source/snapshot']
+
+
+def test_push_skips_archive_managed_paths(caplog, mocker, tmpdir):
+    """
+    Regular push skips individual files below archive-managed paths.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    other_dir = os.path.join(data_dir, 'source', 'other')
+    os.makedirs(snapshot_dir)
+    os.makedirs(other_dir)
+    open(os.path.join(snapshot_dir, 'archived.txt'), 'w').close()
+    open(os.path.join(other_dir, 'normal.txt'), 'w').close()
+    archive_metadata = os.path.join(sync_dir, 'datakit-data-archives.json')
+    with open(archive_metadata, 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+    mocker.patch('datakit_data.s3.boto3.Session')
+    upload = mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
+
+    assert result == 0
+    upload_keys = {call.args[2] for call in upload.call_args_list}
+    assert upload_keys == {'2017/fake-project/source/other/normal.txt'}
+    assert 'skipping archive-managed path(s): source/snapshot' in caplog.text
+
+
+def test_push_archive_requires_one_path(caplog, mocker):
+    """
+    Archive push refuses ambiguous or missing paths.
+    """
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push('data/', '2017/fake-project', archive=True)
+
+    assert result == 1
+    assert 'Archive mode requires exactly one --path value' in caplog.text
+    mock_session.assert_not_called()
+
+
 def test_push_dryrun(caplog, mocker):
     """
     S3.push with --dryrun logs intended uploads without transferring anything.
@@ -648,6 +1013,41 @@ def test_push_delete(mocker):
     )
 
 
+def test_push_delete_preserves_archive_managed_remote_paths(mocker, tmpdir):
+    """
+    S3.push with --delete must not remove archive objects or keys below archive-managed paths.
+    """
+    sync_dir = str(tmpdir.mkdir('sync'))
+    with open(os.path.join(sync_dir, 'datakit-data-archives.json'), 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+    mocker.patch('datakit_data.s3.list_local_files', return_value={'foo': 'data/foo'})
+    mocker.patch.object(S3, '_list_s3_keys', return_value=[
+        '2017/fake-project/foo',
+        '2017/fake-project/stale',
+        '2017/fake-project/source/snapshot.zip',
+        '2017/fake-project/source/snapshot.manifest.json',
+        '2017/fake-project/source/snapshot/extracted.txt',
+    ])
+    mocker.patch.object(S3, '_upload', return_value='etag')
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_client.delete_objects.return_value = {'Deleted': [{'Key': '2017/fake-project/stale'}]}
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(
+        'data/',
+        '2017/fake-project',
+        extra_flags=['--delete'],
+        sync_status_dir=sync_dir,
+    )
+
+    assert result == 0
+    mock_client.delete_objects.assert_called_once_with(
+        Bucket='foo.org',
+        Delete={'Objects': [{'Key': '2017/fake-project/stale'}]},
+    )
+
+
 def test_pull_delete(mocker):
     """
     S3.pull with --delete removes local files that are absent from S3.
@@ -686,6 +1086,38 @@ def test_pull_delete_preserves_sync_markers(mocker, tmpdir):
 
     assert result == 0
     mock_remove.assert_not_called()
+
+
+def test_pull_delete_preserves_archive_managed_paths(mocker, tmpdir):
+    """
+    S3.pull with --delete must not remove extracted files below archive-managed paths.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    normal_dir = os.path.join(data_dir, 'source', 'normal')
+    os.makedirs(snapshot_dir)
+    os.makedirs(normal_dir)
+    archived_path = os.path.join(snapshot_dir, 'archived.txt')
+    normal_path = os.path.join(normal_dir, 'normal.txt')
+    open(archived_path, 'w').close()
+    open(normal_path, 'w').close()
+    with open(os.path.join(sync_dir, 'datakit-data-archives.json'), 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mock_remove = mocker.patch('datakit_data.s3.os.remove')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(
+        data_dir,
+        '2017/fake-project',
+        extra_flags=['--delete'],
+        sync_status_dir=sync_dir,
+    )
+
+    assert result == 0
+    mock_remove.assert_called_once_with(normal_path)
 
 
 def test_pull_delete_error(caplog, mocker):

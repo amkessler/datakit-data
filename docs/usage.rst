@@ -247,6 +247,55 @@ For many small files, `push` can use parallel uploads with a bounded worker pool
 
 The default is `--jobs 1`, which preserves serial upload behavior.
 
+Archive mode
+~~~~~~~~~~~~
+
+For immutable snapshots with many small files, `push` can package one selected subtree into a zip
+archive and upload that archive plus a JSON manifest instead of uploading each file separately.
+
+To archive one subtree under `data/`::
+
+  $ datakit data push --archive --path data/source/current_snapshot
+
+This creates S3 objects like::
+
+  source/current_snapshot.zip
+  source/current_snapshot.manifest.json
+
+The manifest records the archive type, archive checksum, root path, and file list. Archive mode
+requires exactly one `--path` value.
+
+After a successful archive push, Datakit records the selected subtree as archive-managed in local
+metadata under the sync status location. Later plain `datakit data push` runs skip individual files
+below archive-managed paths, so mixed projects can keep extracted archive contents locally without
+accidentally uploading those files one by one. To update an archive-managed subtree, run archive push
+again for that path. `datakit data push delete` also preserves archive objects and remote keys below
+archive-managed paths.
+
+A regular pull treats archives as ordinary files and does not extract them::
+
+  $ datakit data pull
+
+To download and extract local archive files that have matching manifests::
+
+  $ datakit data pull --expand-archives
+
+To restore one archived snapshot directly from S3::
+
+  $ datakit data pull --archive --path data/source/current_snapshot
+
+Archive extraction validates the archive against its manifest when a checksum is available and
+refuses to overwrite existing local files. Once a snapshot has been expanded, `datakit data pull
+delete` preserves files below archive-managed paths instead of pruning them just because the
+individual files are not present as separate S3 objects.
+
+`datakit data status --all` reports archive zip and manifest objects as ordinary S3 objects unless
+you have expanded those archives locally.
+
+Archive mode is best for immutable snapshots where users usually restore the whole snapshot. If
+users need frequent access to individual files directly in S3, normal per-file push/pull remains the
+better storage layout.
+
 Concurrency
 ~~~~~~~~~~~~
 

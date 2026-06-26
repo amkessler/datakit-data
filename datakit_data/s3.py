@@ -4,6 +4,10 @@ import mimetypes
 import fnmatch
 import time
 import threading
+import json
+import hashlib
+import tempfile
+import zipfile
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging import NullHandler
@@ -45,6 +49,12 @@ FILTERED_PATH_DELETE_MSG = (
     "\n*** Refusing --delete with push filters: this would compare a filtered local "
     "file set against the full S3 prefix. Run delete without --path/--include/--exclude. ***\n"
 )
+
+ARCHIVE_REQUIRES_ONE_PATH_MSG = "\n*** Archive mode requires exactly one --path value. ***\n"
+
+ARCHIVE_EXT = '.zip'
+ARCHIVE_MANIFEST_EXT = '.manifest.json'
+ARCHIVE_METADATA_FILENAME = 'datakit-data-archives.json'
 
 
 def _normalize_rel_path(path):
@@ -95,6 +105,63 @@ def _candidate_roots(data_dir, paths):
             continue
         roots.append(os.path.join(data_dir, *rel_path.split('/')) if rel_path else data_dir)
     return roots
+
+
+def _archive_rel_paths(data_dir, path):
+    rel_path = _normalize_filter_path(data_dir, path)
+    if rel_path is None or not rel_path:
+        return None, None
+    archive_rel = rel_path + ARCHIVE_EXT
+    manifest_rel = rel_path + ARCHIVE_MANIFEST_EXT
+    return archive_rel, manifest_rel
+
+
+def _archive_metadata_dir(sync_status_dir):
+    return sync_status_dir or '.sync_status'
+
+
+def _archive_metadata_path(sync_status_dir):
+    return os.path.join(_archive_metadata_dir(sync_status_dir), ARCHIVE_METADATA_FILENAME)
+
+
+def read_archive_paths(sync_status_dir):
+    metadata_path = _archive_metadata_path(sync_status_dir)
+    if not os.path.exists(metadata_path):
+        return []
+    with open(metadata_path) as f:
+        data = json.load(f)
+    return sorted(set(data.get('archive_paths', [])))
+
+
+def write_archive_paths(sync_status_dir, archive_paths):
+    metadata_path = _archive_metadata_path(sync_status_dir)
+    os.makedirs(os.path.dirname(os.path.abspath(metadata_path)), exist_ok=True)
+    data = {
+        'version': 1,
+        'archive_paths': sorted(set(archive_paths)),
+    }
+    with open(metadata_path, 'w') as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def register_archive_path(sync_status_dir, archive_path):
+    archive_paths = read_archive_paths(sync_status_dir)
+    if archive_path not in archive_paths:
+        archive_paths.append(archive_path)
+        write_archive_paths(sync_status_dir, archive_paths)
+
+
+def _is_under_archive_path(rel_path, archive_path):
+    return rel_path == archive_path or rel_path.startswith(archive_path.rstrip('/') + '/')
+
+
+def _is_archive_managed_remote_path(rel_path, archive_path):
+    archive_path = archive_path.rstrip('/')
+    return (
+        _is_under_archive_path(rel_path, archive_path) or
+        rel_path == archive_path + ARCHIVE_EXT or
+        rel_path == archive_path + ARCHIVE_MANIFEST_EXT
+    )
 
 
 def list_local_files(data_dir, paths=None, include_patterns=None, exclude_patterns=None):
@@ -164,6 +231,14 @@ def validate_local_files(local_files, progress_callback=None, jobs=1):
     return issues
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class S3:
     """A limited, human-friendly interface to S3."""
 
@@ -182,7 +257,7 @@ class S3:
 
     def push(
         self, data_dir, s3_path='', extra_flags=None, sync_status_dir=None,
-        paths=None, include_patterns=None, exclude_patterns=None, jobs=1
+        paths=None, include_patterns=None, exclude_patterns=None, jobs=1, archive=False
     ):
         extra_flags = extra_flags or []
         paths = paths or []
@@ -200,15 +275,26 @@ class S3:
         if delete and (paths or include_patterns or exclude_patterns):
             logger.info(FILTERED_PATH_DELETE_MSG)
             return 1
+        if archive:
+            return self.push_archive(data_dir, s3_path, paths, extra_flags, sync_status_dir)
         markers = SyncMarkers(sync_status_dir)
         failures = 0
         logger.info("push discovery: scanning local files")
+        archive_paths = read_archive_paths(sync_status_dir)
+        if archive_paths:
+            logger.info(f"push discovery: skipping archive-managed path(s): {', '.join(archive_paths)}")
         local_files = list_local_files(
             data_dir,
             paths=paths,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
         )
+        if archive_paths:
+            local_files = {
+                rel_path: local_path
+                for rel_path, local_path in local_files.items()
+                if not any(_is_under_archive_path(rel_path, archive_path) for archive_path in archive_paths)
+            }
         started = time.monotonic()
         total = len(local_files)
         logger.info(f"push discovery: selected {total} file(s)")
@@ -279,13 +365,85 @@ class S3:
                 client = self._client()
             remote_keys = self._list_s3_keys(client, prefix)
             remote_rel = {k[len(prefix):] for k in remote_keys}
-            to_delete = [prefix + rel_path for rel_path in sorted(remote_rel - set(local_files.keys()))]
+            to_delete = [
+                prefix + rel_path
+                for rel_path in sorted(remote_rel - set(local_files.keys()))
+                if not any(_is_archive_managed_remote_path(rel_path, archive_path) for archive_path in archive_paths)
+            ]
             for key in to_delete:
                 logger.info(f"delete: s3://{self.bucket}/{key}")
             if not dryrun:
                 failures += self._delete_keys(client, to_delete)
         self._log_push_summary(total, uploaded, skipped, failures, started)
         return failures
+
+    def push_archive(self, data_dir, s3_path='', paths=None, extra_flags=None, sync_status_dir=None):
+        extra_flags = extra_flags or []
+        paths = paths or []
+        dryrun = '--dryrun' in extra_flags or '--dry-run' in extra_flags
+        if len(paths) != 1:
+            logger.info(ARCHIVE_REQUIRES_ONE_PATH_MSG)
+            return 1
+        archive_rel, manifest_rel = _archive_rel_paths(data_dir, paths[0])
+        if archive_rel is None:
+            logger.info(ARCHIVE_REQUIRES_ONE_PATH_MSG)
+            return 1
+        archive_root_rel = _normalize_filter_path(data_dir, paths[0])
+        prefix = self._normalize_prefix(s3_path)
+        archive_key = prefix + archive_rel
+        manifest_key = prefix + manifest_rel
+        archive_root = os.path.join(data_dir, *archive_root_rel.split('/'))
+        local_files = list_local_files(data_dir, paths=paths)
+        logger.info(f"archive push: selected {len(local_files)} file(s) under {paths[0]}")
+        issues = validate_local_files(local_files)
+        if issues:
+            for issue in issues:
+                logger.info(f"preflight error: {issue.path}: {issue.message}")
+            return len(issues)
+        logger.info(f"archive upload: {archive_rel} to s3://{self.bucket}/{archive_key}")
+        logger.info(f"archive upload: {manifest_rel} to s3://{self.bucket}/{manifest_key}")
+        if dryrun:
+            return 0
+        markers = SyncMarkers(sync_status_dir)
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = os.path.join(tmpdir, os.path.basename(archive_rel))
+            manifest_path = os.path.join(tmpdir, os.path.basename(manifest_rel))
+            manifest = self._create_archive(data_dir, archive_root, local_files, archive_rel, archive_path)
+            with open(manifest_path, 'w') as f:
+                json.dump(manifest, f, indent=2, sort_keys=True)
+            try:
+                archive_etag = self._upload(client, archive_path, archive_key, markers.enabled)
+                manifest_etag = self._upload(client, manifest_path, manifest_key, markers.enabled)
+                if markers.enabled:
+                    markers.write(archive_rel, archive_etag)
+                    markers.write(manifest_rel, manifest_etag)
+            except (ClientError, BotoCoreError, OSError) as e:
+                logger.info(f"\n*** Error ***\n{e}\n")
+                return 1
+        register_archive_path(sync_status_dir, archive_root_rel)
+        return 0
+
+    def _create_archive(self, data_dir, archive_root, local_files, archive_rel, archive_path):
+        root_rel = os.path.relpath(archive_root, data_dir).replace(os.sep, '/')
+        manifest_files = []
+        with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+            for rel_path, local_path in sorted(local_files.items()):
+                archive.write(local_path, arcname=rel_path)
+                stat = os.stat(local_path)
+                manifest_files.append({
+                    'path': rel_path,
+                    'size': stat.st_size,
+                    'mtime': stat.st_mtime,
+                })
+        return {
+            'version': 1,
+            'archive_type': 'zip',
+            'archive_path': archive_rel,
+            'archive_sha256': _sha256_file(archive_path),
+            'root_path': root_rel,
+            'files': manifest_files,
+        }
 
     def _iter_push_decisions(self, local_files, markers, prefix, force, jobs):
         items = sorted(local_files.items())
@@ -320,8 +478,12 @@ class S3:
         etag = self._upload(thread_clients.client, local_path, key, need_etag)
         return rel_path, etag
 
-    def pull(self, data_dir, s3_path='', extra_flags=None, sync_status_dir=None):
+    def pull(
+        self, data_dir, s3_path='', extra_flags=None, sync_status_dir=None,
+        archive=False, paths=None, expand_archives=False
+    ):
         extra_flags = extra_flags or []
+        paths = paths or []
         dryrun = '--dryrun' in extra_flags or '--dry-run' in extra_flags
         delete = '--delete' in extra_flags
         force = '--force' in extra_flags
@@ -329,6 +491,8 @@ class S3:
         if delete and not prefix:
             logger.info(EMPTY_PATH_DELETE_MSG)
             return 1
+        if archive:
+            return self.pull_archive(data_dir, s3_path, paths, extra_flags, sync_status_dir)
         markers = SyncMarkers(sync_status_dir)
         client = self._client()
         failures = 0
@@ -355,7 +519,10 @@ class S3:
         if delete:
             local_files = list_local_files(data_dir)
             remote_rel = set(remote_objects)
+            archive_paths = read_archive_paths(sync_status_dir)
             for rel_path, local_path in sorted(local_files.items()):
+                if any(_is_under_archive_path(rel_path, archive_path) for archive_path in archive_paths):
+                    continue
                 if rel_path not in remote_rel:
                     logger.info(f"delete: {local_path}")
                     if not dryrun:
@@ -364,7 +531,115 @@ class S3:
                         except OSError as e:
                             failures += 1
                             logger.info(f"\n*** Error ***\n{e}\n")
+        if expand_archives:
+            failures += self._expand_local_archives(data_dir, dryrun, sync_status_dir)
         return failures
+
+    def pull_archive(self, data_dir, s3_path='', paths=None, extra_flags=None, sync_status_dir=None):
+        extra_flags = extra_flags or []
+        paths = paths or []
+        dryrun = '--dryrun' in extra_flags or '--dry-run' in extra_flags
+        if len(paths) != 1:
+            logger.info(ARCHIVE_REQUIRES_ONE_PATH_MSG)
+            return 1
+        archive_rel, manifest_rel = _archive_rel_paths(data_dir, paths[0])
+        if archive_rel is None:
+            logger.info(ARCHIVE_REQUIRES_ONE_PATH_MSG)
+            return 1
+        prefix = self._normalize_prefix(s3_path)
+        client = self._client()
+        markers = SyncMarkers(sync_status_dir)
+        failures = 0
+        for rel_path in (manifest_rel, archive_rel):
+            key = prefix + rel_path
+            local_path = os.path.join(data_dir, rel_path)
+            logger.info(f"download: s3://{self.bucket}/{key} to {local_path}")
+            if dryrun:
+                continue
+            os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+            try:
+                client.download_file(self.bucket, key, local_path)
+                if markers.enabled:
+                    markers.write(rel_path, self._object_etag(client, key))
+            except (ClientError, BotoCoreError, OSError) as e:
+                failures += 1
+                logger.info(f"\n*** Error ***\n{e}\n")
+        if not dryrun and failures == 0:
+            manifest_path = os.path.join(data_dir, manifest_rel)
+            archive_root = self._archive_root_from_manifest(manifest_path)
+            extract_failures = self._extract_archive(os.path.join(data_dir, archive_rel), data_dir, manifest_path)
+            failures += extract_failures
+            if extract_failures == 0:
+                register_archive_path(sync_status_dir, archive_root or _normalize_filter_path(data_dir, paths[0]))
+        elif dryrun:
+            logger.info(f"extract archive: {os.path.join(data_dir, archive_rel)} to {data_dir}")
+        return failures
+
+    def _expand_local_archives(self, data_dir, dryrun=False, sync_status_dir=None):
+        failures = 0
+        for root, _, filenames in os.walk(data_dir):
+            for filename in filenames:
+                if not filename.endswith(ARCHIVE_EXT):
+                    continue
+                archive_path = os.path.join(root, filename)
+                manifest_path = archive_path[:-len(ARCHIVE_EXT)] + ARCHIVE_MANIFEST_EXT
+                if not os.path.exists(manifest_path):
+                    continue
+                if dryrun:
+                    logger.info(f"extract archive: {archive_path} to {data_dir}")
+                    continue
+                manifest = self._read_archive_manifest(manifest_path)
+                archive_root = manifest.get('root_path') if manifest else None
+                extract_failures = self._extract_archive(archive_path, data_dir, manifest_path)
+                failures += extract_failures
+                if extract_failures == 0 and archive_root:
+                    register_archive_path(sync_status_dir, archive_root)
+        return failures
+
+    def _read_archive_manifest(self, manifest_path):
+        try:
+            with open(manifest_path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _archive_root_from_manifest(self, manifest_path):
+        manifest = self._read_archive_manifest(manifest_path)
+        if manifest is None:
+            return None
+        return manifest.get('root_path')
+
+    def _extract_archive(self, archive_path, data_dir, manifest_path=None):
+        logger.info(f"extract archive: {archive_path} to {data_dir}")
+        try:
+            if manifest_path:
+                self._validate_archive_against_manifest(archive_path, manifest_path)
+            with zipfile.ZipFile(archive_path) as archive:
+                data_root = os.path.abspath(data_dir)
+                for member in archive.namelist():
+                    target = os.path.abspath(os.path.join(data_dir, member))
+                    if target != data_root and not target.startswith(data_root + os.sep):
+                        raise OSError(f"Archive member escapes data dir: {member}")
+                    if os.path.exists(target):
+                        raise OSError(f"Archive extraction would overwrite existing path: {member}")
+                archive.extractall(data_dir)
+        except (OSError, zipfile.BadZipFile) as e:
+            logger.info(f"\n*** Error ***\n{e}\n")
+            return 1
+        return 0
+
+    def _validate_archive_against_manifest(self, archive_path, manifest_path):
+        manifest = self._read_archive_manifest(manifest_path)
+        if manifest is None:
+            raise OSError(f"Could not read archive manifest: {manifest_path}")
+        expected_archive = manifest.get('archive_path')
+        if expected_archive and os.path.basename(expected_archive) != os.path.basename(archive_path):
+            raise OSError(
+                f"Archive path does not match manifest: {os.path.basename(archive_path)} != {expected_archive}"
+            )
+        expected_sha256 = manifest.get('archive_sha256')
+        if expected_sha256 and _sha256_file(archive_path) != expected_sha256:
+            raise OSError(f"Archive checksum does not match manifest: {archive_path}")
 
     def compare(self, data_dir, s3_path='', sync_status_dir=None):
         """Compare local data files against the bucket's live listing.

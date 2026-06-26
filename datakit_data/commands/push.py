@@ -45,6 +45,12 @@ class Push(ProjectMixin, CommandHelpers, Command):
             help="Create sync status files in data/ instead of the configured location"
         )
         parser.add_argument(
+            '--archive',
+            action='store_true',
+            default=False,
+            help="Upload the selected --path as one zip archive plus a manifest"
+        )
+        parser.add_argument(
             '--path',
             action='append',
             default=[],
@@ -113,6 +119,8 @@ class Push(ProjectMixin, CommandHelpers, Command):
         jobs = getattr(parsed_args, 'jobs', 1)
         if isinstance(jobs, int) and jobs != 1:
             push_kwargs['jobs'] = jobs
+        if getattr(parsed_args, 'archive', False) is True:
+            push_kwargs['archive'] = True
         failures = s3.push(
             'data/',
             self.project_configs['s3_path'],
