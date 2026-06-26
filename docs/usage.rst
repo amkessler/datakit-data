@@ -272,6 +272,14 @@ accidentally uploading those files one by one. To update an archive-managed subt
 again for that path. `datakit data push delete` also preserves archive objects and remote keys below
 archive-managed paths.
 
+To convert a path that was previously pushed as individual files into archive mode, use
+`--prune-individuals`::
+
+  $ datakit data push --archive --path data/source/current_snapshot --prune-individuals
+
+This uploads the archive and manifest first. Only after those uploads succeed does Datakit delete
+the old individual S3 objects below the selected path. Plain `--archive` never performs that prune.
+
 A regular pull treats archives as ordinary files and does not extract them::
 
   $ datakit data pull

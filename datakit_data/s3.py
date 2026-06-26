@@ -51,6 +51,7 @@ FILTERED_PATH_DELETE_MSG = (
 )
 
 ARCHIVE_REQUIRES_ONE_PATH_MSG = "\n*** Archive mode requires exactly one --path value. ***\n"
+ARCHIVE_PRUNE_REQUIRES_ARCHIVE_MSG = "\n*** --prune-individuals requires --archive. ***\n"
 
 ARCHIVE_EXT = '.zip'
 ARCHIVE_MANIFEST_EXT = '.manifest.json'
@@ -257,7 +258,8 @@ class S3:
 
     def push(
         self, data_dir, s3_path='', extra_flags=None, sync_status_dir=None,
-        paths=None, include_patterns=None, exclude_patterns=None, jobs=1, archive=False
+        paths=None, include_patterns=None, exclude_patterns=None, jobs=1, archive=False,
+        prune_individuals=False
     ):
         extra_flags = extra_flags or []
         paths = paths or []
@@ -275,8 +277,11 @@ class S3:
         if delete and (paths or include_patterns or exclude_patterns):
             logger.info(FILTERED_PATH_DELETE_MSG)
             return 1
+        if prune_individuals and not archive:
+            logger.info(ARCHIVE_PRUNE_REQUIRES_ARCHIVE_MSG)
+            return 1
         if archive:
-            return self.push_archive(data_dir, s3_path, paths, extra_flags, sync_status_dir)
+            return self.push_archive(data_dir, s3_path, paths, extra_flags, sync_status_dir, prune_individuals)
         markers = SyncMarkers(sync_status_dir)
         failures = 0
         logger.info("push discovery: scanning local files")
@@ -377,7 +382,10 @@ class S3:
         self._log_push_summary(total, uploaded, skipped, failures, started)
         return failures
 
-    def push_archive(self, data_dir, s3_path='', paths=None, extra_flags=None, sync_status_dir=None):
+    def push_archive(
+        self, data_dir, s3_path='', paths=None, extra_flags=None, sync_status_dir=None,
+        prune_individuals=False
+    ):
         extra_flags = extra_flags or []
         paths = paths or []
         dryrun = '--dryrun' in extra_flags or '--dry-run' in extra_flags
@@ -403,6 +411,11 @@ class S3:
         logger.info(f"archive upload: {archive_rel} to s3://{self.bucket}/{archive_key}")
         logger.info(f"archive upload: {manifest_rel} to s3://{self.bucket}/{manifest_key}")
         if dryrun:
+            if prune_individuals:
+                logger.info(
+                    f"archive prune: would delete individual objects below "
+                    f"s3://{self.bucket}/{prefix + archive_root_rel}/ after successful upload"
+                )
             return 0
         markers = SyncMarkers(sync_status_dir)
         client = self._client()
@@ -422,6 +435,8 @@ class S3:
                 logger.info(f"\n*** Error ***\n{e}\n")
                 return 1
         register_archive_path(sync_status_dir, archive_root_rel)
+        if prune_individuals:
+            return self._prune_archive_individuals(client, prefix, archive_root_rel)
         return 0
 
     def _create_archive(self, data_dir, archive_root, local_files, archive_rel, archive_path):
@@ -444,6 +459,21 @@ class S3:
             'root_path': root_rel,
             'files': manifest_files,
         }
+
+    def _prune_archive_individuals(self, client, prefix, archive_root_rel):
+        list_prefix = prefix + archive_root_rel.rstrip('/')
+        remote_keys = self._list_s3_keys(client, list_prefix)
+        to_delete = [
+            key for key in sorted(remote_keys)
+            if _is_under_archive_path(key[len(prefix):], archive_root_rel)
+        ]
+        logger.info(
+            f"archive prune: deleting {len(to_delete)} individual object(s) below "
+            f"s3://{self.bucket}/{prefix + archive_root_rel.rstrip('/')}/"
+        )
+        for key in to_delete:
+            logger.info(f"delete: s3://{self.bucket}/{key}")
+        return self._delete_keys(client, to_delete)
 
     def _iter_push_decisions(self, local_files, markers, prefix, force, jobs):
         items = sorted(local_files.items())

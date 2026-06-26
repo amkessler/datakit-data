@@ -26,6 +26,12 @@ and upload all of its individual files. That defeats the purpose of archive mode
    - Still works for archive-managed paths.
    - Rebuilds and uploads that archive.
 
+4. `datakit data push --archive --path PATH --prune-individuals`
+   - Converts a previously per-file path to archive mode.
+   - Uploads `PATH.zip` and `PATH.manifest.json` first.
+   - Deletes existing individual S3 objects below `PATH` only after the archive upload succeeds.
+   - Leaves pruning opt-in because it is destructive.
+
 ## Metadata Format
 
 Store metadata as JSON:
@@ -57,4 +63,6 @@ When no sync status location is configured, use:
 - Regular push excludes files below recorded archive-managed paths.
 - Regular push still uploads files outside those paths.
 - Archive push still includes the archive-managed subtree contents.
+- Archive prune only deletes individual S3 objects after archive upload succeeds.
+- Archive prune preserves `PATH.zip` and `PATH.manifest.json`.
 - Tests cover metadata read/write and skip behavior.

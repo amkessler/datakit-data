@@ -51,6 +51,12 @@ class Push(ProjectMixin, CommandHelpers, Command):
             help="Upload the selected --path as one zip archive plus a manifest"
         )
         parser.add_argument(
+            '--prune-individuals',
+            action='store_true',
+            default=False,
+            help="With --archive, delete existing individual S3 objects below the selected path after upload"
+        )
+        parser.add_argument(
             '--path',
             action='append',
             default=[],
@@ -121,6 +127,8 @@ class Push(ProjectMixin, CommandHelpers, Command):
             push_kwargs['jobs'] = jobs
         if getattr(parsed_args, 'archive', False) is True:
             push_kwargs['archive'] = True
+        if getattr(parsed_args, 'prune_individuals', False) is True:
+            push_kwargs['prune_individuals'] = True
         failures = s3.push(
             'data/',
             self.project_configs['s3_path'],

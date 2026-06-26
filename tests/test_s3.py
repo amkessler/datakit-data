@@ -917,6 +917,86 @@ def test_push_archive_records_archive_managed_path(mocker, tmpdir):
     assert read_archive_paths(sync_dir) == ['source/snapshot']
 
 
+def test_push_archive_prunes_individual_objects_after_upload(mocker, tmpdir):
+    """
+    Archive push with prune_individuals deletes old per-file objects after archive upload succeeds.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    os.makedirs(snapshot_dir)
+    open(os.path.join(snapshot_dir, 'a.txt'), 'w').close()
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mocker.patch.object(S3, '_upload', return_value='etag')
+    list_keys = mocker.patch.object(S3, '_list_s3_keys', return_value=[
+        '2017/fake-project/source/snapshot/a.txt',
+        '2017/fake-project/source/snapshot/stale.txt',
+        '2017/fake-project/source/snapshot.zip',
+        '2017/fake-project/source/snapshot.manifest.json',
+    ])
+    delete_keys = mocker.patch.object(S3, '_delete_keys', return_value=0)
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(
+        data_dir,
+        '2017/fake-project',
+        paths=['source/snapshot'],
+        archive=True,
+        prune_individuals=True,
+        sync_status_dir=sync_dir,
+    )
+
+    assert result == 0
+    list_keys.assert_called_once_with(mock_client, '2017/fake-project/source/snapshot')
+    delete_keys.assert_called_once_with(mock_client, [
+        '2017/fake-project/source/snapshot/a.txt',
+        '2017/fake-project/source/snapshot/stale.txt',
+    ])
+    assert read_archive_paths(sync_dir) == ['source/snapshot']
+
+
+def test_push_archive_prune_does_not_run_when_upload_fails(mocker, tmpdir):
+    """
+    Archive prune does not delete old individual objects when archive upload fails.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    snapshot_dir = os.path.join(data_dir, 'source', 'snapshot')
+    os.makedirs(snapshot_dir)
+    open(os.path.join(snapshot_dir, 'a.txt'), 'w').close()
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mocker.patch.object(S3, '_upload', side_effect=OSError('upload failed'))
+    list_keys = mocker.patch.object(S3, '_list_s3_keys')
+    delete_keys = mocker.patch.object(S3, '_delete_keys')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(
+        data_dir,
+        '2017/fake-project',
+        paths=['source/snapshot'],
+        archive=True,
+        prune_individuals=True,
+    )
+
+    assert result == 1
+    list_keys.assert_not_called()
+    delete_keys.assert_not_called()
+
+
+def test_push_prune_individuals_requires_archive(caplog, mocker):
+    """
+    prune_individuals is refused without archive mode.
+    """
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push('data/', '2017/fake-project', prune_individuals=True)
+
+    assert result == 1
+    assert '--prune-individuals requires --archive' in caplog.text
+    mock_session.assert_not_called()
+
+
 def test_push_skips_archive_managed_paths(caplog, mocker, tmpdir):
     """
     Regular push skips individual files below archive-managed paths.

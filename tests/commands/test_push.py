@@ -136,6 +136,7 @@ def test_get_parser():
     assert hasattr(args, 'verbose')
     assert hasattr(args, 'sync_status_in_data')
     assert hasattr(args, 'archive')
+    assert hasattr(args, 'prune_individuals')
     assert hasattr(args, 'path')
     assert hasattr(args, 'include')
     assert hasattr(args, 'exclude')
@@ -194,6 +195,34 @@ def test_archive_option_forwarded(mocker):
         sync_status_dir=None,
         paths=['data/source/snapshot'],
         archive=True,
+    )
+
+
+def test_archive_prune_individuals_option_forwarded(mocker):
+    """
+    --prune-individuals is parsed and forwarded to S3.push.
+    """
+    push_mock = mocker.patch(
+        'datakit_data.commands.push.S3.push',
+        autospec=True,
+    )
+    push_mock.return_value = 0
+    cmd = Push(mock.Mock(), None, 'data push')
+    parsed_args = cmd.get_parser('data push').parse_args([
+        '--archive',
+        '--path', 'data/source/snapshot',
+        '--prune-individuals',
+    ])
+    cmd.run(parsed_args)
+    push_mock.assert_any_call(
+        mock.ANY,
+        'data/',
+        '2017/fake-project',
+        extra_flags=[],
+        sync_status_dir=None,
+        paths=['data/source/snapshot'],
+        archive=True,
+        prune_individuals=True,
     )
 
 
