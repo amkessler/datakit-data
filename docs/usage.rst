@@ -263,7 +263,7 @@ This creates S3 objects like::
   source/current_snapshot.manifest.json
 
 The manifest records the archive type, archive checksum, root path, and file list. Archive mode
-requires exactly one `--path` value.
+requires exactly one `--path` value and cannot be combined with `--include` or `--exclude`.
 
 After a successful archive push, Datakit records the selected subtree as archive-managed in local
 metadata under the sync status location. Later plain `datakit data push` runs skip individual files

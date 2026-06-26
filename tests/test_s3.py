@@ -4,12 +4,50 @@ import threading
 import json
 import zipfile
 import hashlib
+import io
 
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 
-from datakit_data.s3 import S3, S3ObjectInfo, list_local_files, read_archive_paths, validate_local_file
+from datakit_data.s3 import S3, S3ObjectInfo, list_data_files, list_local_files, read_archive_paths, validate_local_file
 from datakit_data.sync_markers import SyncMarkers
+
+
+def _archive_bytes(entries):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        for path, content in entries.items():
+            archive.writestr(path, content)
+    return buffer.getvalue()
+
+
+def _archive_manifest(archive_data, entries, archive_rel='source/snapshot.zip', root_path='source/snapshot', **kwargs):
+    manifest = {
+        'version': 1,
+        'archive_type': 'zip',
+        'archive_path': archive_rel,
+        'archive_sha256': hashlib.sha256(archive_data).hexdigest(),
+        'root_path': root_path,
+        'files': [
+            {'path': path, 'size': len(content.encode())}
+            for path, content in sorted(entries.items())
+        ],
+    }
+    manifest.update(kwargs)
+    return manifest
+
+
+def _write_datakit_archive(data_dir, entries=None, archive_rel='source/snapshot.zip', root_path='source/snapshot', **kwargs):
+    entries = entries or {'source/snapshot/a.txt': 'alpha'}
+    archive_data = _archive_bytes(entries)
+    archive_path = os.path.join(data_dir, *archive_rel.split('/'))
+    manifest_path = archive_path[:-len('.zip')] + '.manifest.json'
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, 'wb') as f:
+        f.write(archive_data)
+    with open(manifest_path, 'w') as f:
+        json.dump(_archive_manifest(archive_data, entries, archive_rel, root_path, **kwargs), f)
+    return archive_path, manifest_path
 
 
 def test_push(mocker, tmpdir):
@@ -363,15 +401,18 @@ def test_pull_archive_downloads_and_extracts(mocker, tmpdir):
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mocker.patch.object(S3, '_object_etag', return_value='etag')
+    entries = {'source/snapshot/a.txt': 'alpha'}
+    archive_data = _archive_bytes(entries)
+    manifest = _archive_manifest(archive_data, entries)
 
     def download_side_effect(bucket, key, local_path):
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         if key.endswith('.zip'):
-            with zipfile.ZipFile(local_path, 'w') as archive:
-                archive.writestr('source/snapshot/a.txt', 'alpha')
+            with open(local_path, 'wb') as f:
+                f.write(archive_data)
         else:
             with open(local_path, 'w') as f:
-                json.dump({'archive_path': 'source/snapshot.zip', 'root_path': 'source/snapshot'}, f)
+                json.dump(manifest, f)
 
     mock_client.download_file.side_effect = download_side_effect
 
@@ -407,19 +448,18 @@ def test_pull_archive_rejects_checksum_mismatch(caplog, mocker, tmpdir):
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
     mocker.patch.object(S3, '_object_etag', return_value='etag')
+    entries = {'source/snapshot/a.txt': 'alpha'}
+    archive_data = _archive_bytes(entries)
+    manifest = _archive_manifest(archive_data, entries, archive_sha256='not-the-real-checksum')
 
     def download_side_effect(bucket, key, local_path):
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         if key.endswith('.zip'):
-            with zipfile.ZipFile(local_path, 'w') as archive:
-                archive.writestr('source/snapshot/a.txt', 'alpha')
+            with open(local_path, 'wb') as f:
+                f.write(archive_data)
         else:
             with open(local_path, 'w') as f:
-                json.dump({
-                    'archive_path': 'source/snapshot.zip',
-                    'archive_sha256': 'not-the-real-checksum',
-                    'root_path': 'source/snapshot',
-                }, f)
+                json.dump(manifest, f)
 
     mock_client.download_file.side_effect = download_side_effect
 
@@ -467,13 +507,7 @@ def test_pull_expand_archives_extracts_local_archives(mocker, tmpdir):
     """
     data_dir = str(tmpdir.mkdir('data'))
     sync_dir = str(tmpdir.mkdir('sync'))
-    archive_path = os.path.join(data_dir, 'source', 'snapshot.zip')
-    manifest_path = os.path.join(data_dir, 'source', 'snapshot.manifest.json')
-    os.makedirs(os.path.dirname(archive_path))
-    with zipfile.ZipFile(archive_path, 'w') as archive:
-        archive.writestr('source/snapshot/a.txt', 'alpha')
-    with open(manifest_path, 'w') as f:
-        json.dump({'archive_path': 'source/snapshot.zip', 'root_path': 'source/snapshot'}, f)
+    _write_datakit_archive(data_dir)
     mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mocker.patch('datakit_data.s3.boto3.Session')
 
@@ -492,17 +526,7 @@ def test_pull_expand_archives_rejects_checksum_mismatch(caplog, mocker, tmpdir):
     """
     data_dir = str(tmpdir.mkdir('data'))
     sync_dir = str(tmpdir.mkdir('sync'))
-    archive_path = os.path.join(data_dir, 'source', 'snapshot.zip')
-    manifest_path = os.path.join(data_dir, 'source', 'snapshot.manifest.json')
-    os.makedirs(os.path.dirname(archive_path))
-    with zipfile.ZipFile(archive_path, 'w') as archive:
-        archive.writestr('source/snapshot/a.txt', 'alpha')
-    with open(manifest_path, 'w') as f:
-        json.dump({
-            'archive_path': 'source/snapshot.zip',
-            'archive_sha256': 'not-the-real-checksum',
-            'root_path': 'source/snapshot',
-        }, f)
+    _write_datakit_archive(data_dir, archive_sha256='not-the-real-checksum')
     mocker.patch.object(S3, '_list_s3_objects', return_value={})
     mocker.patch('datakit_data.s3.boto3.Session')
 
@@ -537,12 +561,7 @@ def test_extract_archive_rejects_manifest_archive_mismatch(caplog, tmpdir):
     Archive extraction refuses a manifest that points at a different archive object.
     """
     data_dir = str(tmpdir.mkdir('data'))
-    archive_path = os.path.join(str(tmpdir), 'snapshot.zip')
-    manifest_path = os.path.join(str(tmpdir), 'snapshot.manifest.json')
-    with zipfile.ZipFile(archive_path, 'w') as archive:
-        archive.writestr('source/snapshot/a.txt', 'alpha')
-    with open(manifest_path, 'w') as f:
-        json.dump({'archive_path': 'source/other.zip', 'root_path': 'source/snapshot'}, f)
+    archive_path, manifest_path = _write_datakit_archive(data_dir, archive_path='source/other.zip')
 
     s3 = S3('ap', 'foo.org')
     result = s3._extract_archive(archive_path, data_dir, manifest_path)
@@ -557,16 +576,7 @@ def test_extract_archive_rejects_checksum_mismatch(caplog, tmpdir):
     Archive extraction refuses an archive whose checksum differs from its manifest.
     """
     data_dir = str(tmpdir.mkdir('data'))
-    archive_path = os.path.join(str(tmpdir), 'snapshot.zip')
-    manifest_path = os.path.join(str(tmpdir), 'snapshot.manifest.json')
-    with zipfile.ZipFile(archive_path, 'w') as archive:
-        archive.writestr('source/snapshot/a.txt', 'alpha')
-    with open(manifest_path, 'w') as f:
-        json.dump({
-            'archive_path': 'source/snapshot.zip',
-            'archive_sha256': 'not-the-real-checksum',
-            'root_path': 'source/snapshot',
-        }, f)
+    archive_path, manifest_path = _write_datakit_archive(data_dir, archive_sha256='not-the-real-checksum')
 
     s3 = S3('ap', 'foo.org')
     result = s3._extract_archive(archive_path, data_dir, manifest_path)
@@ -585,18 +595,7 @@ def test_extract_archive_refuses_to_overwrite_existing_files(caplog, tmpdir):
     os.makedirs(os.path.dirname(existing_path))
     with open(existing_path, 'w') as f:
         f.write('local edit')
-    archive_path = os.path.join(str(tmpdir), 'snapshot.zip')
-    manifest_path = os.path.join(str(tmpdir), 'snapshot.manifest.json')
-    with zipfile.ZipFile(archive_path, 'w') as archive:
-        archive.writestr('source/snapshot/a.txt', 'remote copy')
-    with open(archive_path, 'rb') as f:
-        checksum = hashlib.sha256(f.read()).hexdigest()
-    with open(manifest_path, 'w') as f:
-        json.dump({
-            'archive_path': 'source/snapshot.zip',
-            'archive_sha256': checksum,
-            'root_path': 'source/snapshot',
-        }, f)
+    archive_path, manifest_path = _write_datakit_archive(data_dir, {'source/snapshot/a.txt': 'remote copy'})
 
     s3 = S3('ap', 'foo.org')
     result = s3._extract_archive(archive_path, data_dir, manifest_path)
@@ -605,6 +604,65 @@ def test_extract_archive_refuses_to_overwrite_existing_files(caplog, tmpdir):
     assert 'Archive extraction would overwrite existing path' in caplog.text
     with open(existing_path) as f:
         assert f.read() == 'local edit'
+
+
+def test_extract_archive_rejects_member_list_mismatch(caplog, tmpdir):
+    """
+    Archive extraction refuses a zip whose members differ from the manifest file list.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    archive_path, manifest_path = _write_datakit_archive(
+        data_dir,
+        {'source/snapshot/a.txt': 'alpha'},
+        files=[{'path': 'source/snapshot/b.txt', 'size': 5}],
+    )
+
+    s3 = S3('ap', 'foo.org')
+    result = s3._extract_archive(archive_path, data_dir, manifest_path)
+
+    assert result == 1
+    assert 'Archive members do not match manifest' in caplog.text
+    assert not os.path.exists(os.path.join(data_dir, 'source', 'snapshot', 'a.txt'))
+
+
+def test_extract_archive_rejects_manifest_paths_outside_root(caplog, tmpdir):
+    """
+    Archive validation normalizes manifest paths before checking the archive root.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    archive_path, manifest_path = _write_datakit_archive(
+        data_dir,
+        {'source/snapshot/../other.txt': 'alpha'},
+    )
+
+    s3 = S3('ap', 'foo.org')
+    result = s3._extract_archive(archive_path, data_dir, manifest_path)
+
+    assert result == 1
+    assert 'Archive manifest file is outside archive root' in caplog.text
+    assert not os.path.exists(os.path.join(data_dir, 'source', 'other.txt'))
+
+
+def test_pull_expand_archives_skips_non_datakit_manifest(mocker, tmpdir):
+    """
+    expand_archives ignores zip files whose sidecar manifest is not a Datakit archive manifest.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    archive_path = os.path.join(data_dir, 'source', 'other.zip')
+    manifest_path = os.path.join(data_dir, 'source', 'other.manifest.json')
+    os.makedirs(os.path.dirname(archive_path))
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('source/other/a.txt', 'alpha')
+    with open(manifest_path, 'w') as f:
+        json.dump({'description': 'not a datakit archive manifest'}, f)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project', expand_archives=True)
+
+    assert result == 0
+    assert not os.path.exists(os.path.join(data_dir, 'source', 'other', 'a.txt'))
 
 
 def test_push_skips_synced_files(mocker, tmpdir):
@@ -1038,6 +1096,26 @@ def test_push_archive_requires_one_path(caplog, mocker):
     mock_session.assert_not_called()
 
 
+def test_push_archive_rejects_include_and_exclude_filters(caplog, mocker):
+    """
+    Archive push refuses include/exclude filters instead of silently ignoring them.
+    """
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(
+        'data/',
+        '2017/fake-project',
+        archive=True,
+        paths=['source/snapshot'],
+        include_patterns=['*.csv'],
+    )
+
+    assert result == 1
+    assert 'Archive mode does not support --include or --exclude' in caplog.text
+    mock_session.assert_not_called()
+
+
 def test_push_dryrun(caplog, mocker):
     """
     S3.push with --dryrun logs intended uploads without transferring anything.
@@ -1198,6 +1276,58 @@ def test_pull_delete_preserves_archive_managed_paths(mocker, tmpdir):
 
     assert result == 0
     mock_remove.assert_called_once_with(normal_path)
+
+
+def test_pull_delete_preserves_archive_metadata_in_data(mocker, tmpdir):
+    """
+    S3.pull with --delete must not remove archive metadata when sync status lives in data/.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    metadata_path = os.path.join(data_dir, 'datakit-data-archives.json')
+    normal_path = os.path.join(data_dir, 'normal.txt')
+    with open(metadata_path, 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+    open(normal_path, 'w').close()
+    mocker.patch.object(S3, '_list_s3_objects', return_value={})
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mock_remove = mocker.patch('datakit_data.s3.os.remove')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(
+        data_dir,
+        '2017/fake-project',
+        extra_flags=['--delete'],
+        sync_status_dir=data_dir,
+    )
+
+    assert result == 0
+    mock_remove.assert_called_once_with(normal_path)
+
+
+def test_compare_excludes_archive_managed_local_paths(mocker, tmpdir):
+    """
+    S3.compare ignores expanded archive-managed files on the local side.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
+    os.makedirs(os.path.join(data_dir, 'source', 'normal'))
+    open(os.path.join(data_dir, 'source', 'snapshot', 'a.txt'), 'w').close()
+    open(os.path.join(data_dir, 'source', 'normal', 'b.txt'), 'w').close()
+    with open(os.path.join(sync_dir, 'datakit-data-archives.json'), 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'source/normal/b.txt': S3ObjectInfo(etag='normal'),
+        'source/snapshot.zip': S3ObjectInfo(etag='zip'),
+        'source/snapshot.manifest.json': S3ObjectInfo(etag='manifest'),
+    })
+    mocker.patch.object(S3, '_client', return_value=mocker.Mock())
+
+    s3 = S3('ap', 'foo.org')
+    comparison = s3.compare(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
+
+    assert 'source/snapshot/a.txt' not in comparison.only_local
+    assert comparison.only_s3 == ['source/snapshot.manifest.json', 'source/snapshot.zip']
 
 
 def test_pull_delete_error(caplog, mocker):
@@ -1510,6 +1640,38 @@ def test_list_local_files(tmpdir):
     assert 'bar' in result
     assert 'foo.synced' not in result
     assert result['foo'] == os.path.join(data_dir, 'foo')
+
+
+def test_list_data_files_excludes_archive_metadata_in_data(tmpdir):
+    """
+    Internal archive metadata is not treated as data when sync status lives in data/.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    with open(os.path.join(data_dir, 'datakit-data-archives.json'), 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+    open(os.path.join(data_dir, 'foo.csv'), 'w').close()
+
+    result = list_data_files(data_dir, sync_status_dir=data_dir)
+
+    assert result == {'foo.csv': os.path.join(data_dir, 'foo.csv')}
+
+
+def test_list_data_files_excludes_archive_managed_paths(tmpdir):
+    """
+    Archive-managed local files can be filtered from status/comparison file listings.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
+    os.makedirs(os.path.join(data_dir, 'source', 'normal'))
+    open(os.path.join(data_dir, 'source', 'snapshot', 'a.txt'), 'w').close()
+    open(os.path.join(data_dir, 'source', 'normal', 'b.txt'), 'w').close()
+    with open(os.path.join(sync_dir, 'datakit-data-archives.json'), 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+
+    result = list_data_files(data_dir, sync_status_dir=sync_dir, skip_archive_managed=True)
+
+    assert result == {'source/normal/b.txt': os.path.join(data_dir, 'source', 'normal', 'b.txt')}
 
 
 def test_list_local_files_nested_keys_use_forward_slashes(tmpdir):

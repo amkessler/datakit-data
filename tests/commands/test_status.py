@@ -1,5 +1,6 @@
 import os
 import time
+import json
 from datetime import datetime
 from unittest import mock
 
@@ -443,6 +444,47 @@ def test_all_excludes_synced_placeholders(caplog, mocker, fake_project):
     mocker.patch.object(S3, '_client', return_value=mock.Mock())
     run_status(scan_all=True)
     assert '0 file(s) local but not on S3' in caplog.text
+
+
+def test_status_excludes_archive_managed_paths(caplog, fake_project):
+    """
+    Default status does not report expanded archive-managed files as missing sync markers.
+    """
+    _make_file(os.path.join(fake_project, 'data', 'source', 'snapshot', 'a.txt'))
+    _make_file(os.path.join(fake_project, 'data', 'normal.csv'))
+    metadata_path = os.path.join(fake_project, '.sync_status', 'datakit-data-archives.json')
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    with open(metadata_path, 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+
+    run_status(filepaths=True)
+
+    assert '1 file(s) missing a .synced file' in caplog.text
+    assert '  normal.csv' in caplog.text
+    assert 'source/snapshot/a.txt' not in caplog.text
+
+
+def test_all_excludes_archive_managed_local_paths(caplog, mocker, fake_project):
+    """
+    --all does not report expanded archive-managed files as local-only objects.
+    """
+    _make_file(os.path.join(fake_project, 'data', 'source', 'snapshot', 'a.txt'))
+    metadata_path = os.path.join(fake_project, '.sync_status', 'datakit-data-archives.json')
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    with open(metadata_path, 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+    mocker.patch.object(S3, '_list_s3_objects', return_value=_make_s3_objects([
+        'source/snapshot.zip',
+        'source/snapshot.manifest.json',
+    ]))
+    mocker.patch.object(S3, '_client', return_value=mock.Mock())
+
+    run_status(scan_all=True, filepaths=True)
+
+    assert '0 file(s) local but not on S3' in caplog.text
+    assert 'source/snapshot/a.txt' not in caplog.text
+    assert '  source/snapshot.zip' in caplog.text
+    assert '  source/snapshot.manifest.json' in caplog.text
 
 
 def test_all_filepaths_local_only(caplog, mocker):

@@ -52,6 +52,7 @@ FILTERED_PATH_DELETE_MSG = (
 
 ARCHIVE_REQUIRES_ONE_PATH_MSG = "\n*** Archive mode requires exactly one --path value. ***\n"
 ARCHIVE_PRUNE_REQUIRES_ARCHIVE_MSG = "\n*** --prune-individuals requires --archive. ***\n"
+ARCHIVE_FILTERS_UNSUPPORTED_MSG = "\n*** Archive mode does not support --include or --exclude. ***\n"
 
 ARCHIVE_EXT = '.zip'
 ARCHIVE_MANIFEST_EXT = '.manifest.json'
@@ -125,6 +126,17 @@ def _archive_metadata_path(sync_status_dir):
     return os.path.join(_archive_metadata_dir(sync_status_dir), ARCHIVE_METADATA_FILENAME)
 
 
+def _archive_metadata_rel_paths(data_dir, sync_status_dir):
+    metadata_path = os.path.abspath(_archive_metadata_path(sync_status_dir))
+    data_root = os.path.abspath(data_dir)
+    try:
+        if os.path.commonpath([data_root, metadata_path]) != data_root:
+            return set()
+    except ValueError:
+        return set()
+    return {_normalize_rel_path(os.path.relpath(metadata_path, data_root))}
+
+
 def read_archive_paths(sync_status_dir):
     metadata_path = _archive_metadata_path(sync_status_dir)
     if not os.path.exists(metadata_path):
@@ -165,7 +177,26 @@ def _is_archive_managed_remote_path(rel_path, archive_path):
     )
 
 
-def list_local_files(data_dir, paths=None, include_patterns=None, exclude_patterns=None):
+def _normalize_archive_manifest_path(path):
+    if not isinstance(path, str):
+        return None
+    rel_path = _normalize_rel_path(os.path.normpath(path.replace('\\', '/')))
+    if not rel_path or rel_path == '.' or rel_path == '..' or rel_path.startswith('../'):
+        return None
+    return rel_path
+
+
+def _filter_archive_managed_files(local_files, archive_paths):
+    if not archive_paths:
+        return local_files
+    return {
+        rel_path: local_path
+        for rel_path, local_path in local_files.items()
+        if not any(_is_under_archive_path(rel_path, archive_path) for archive_path in archive_paths)
+    }
+
+
+def list_local_files(data_dir, paths=None, include_patterns=None, exclude_patterns=None, ignored_rel_paths=None):
     # Map of rel_path -> full path for every data file under data_dir, excluding .synced
     # markers (which live alongside the data when sync_status_location is data/). The key is
     # used to build/compare S3 keys, which always use '/'; normalize the OS separator so keys
@@ -174,6 +205,7 @@ def list_local_files(data_dir, paths=None, include_patterns=None, exclude_patter
     paths = paths or []
     include_patterns = [_strip_data_prefix(pattern) for pattern in include_patterns or []]
     exclude_patterns = [_strip_data_prefix(pattern) for pattern in exclude_patterns or []]
+    ignored_rel_paths = set(ignored_rel_paths or [])
     files = {}
     for root_path in _candidate_roots(data_dir, paths):
         if os.path.isfile(root_path) or os.path.islink(root_path):
@@ -188,10 +220,28 @@ def list_local_files(data_dir, paths=None, include_patterns=None, exclude_patter
                     continue
                 full_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(full_path, data_dir).replace(os.sep, '/')
+                if rel_path in ignored_rel_paths:
+                    continue
                 if not _selected_by_patterns(rel_path, include_patterns, exclude_patterns):
                     continue
                 files[rel_path] = full_path
     return files
+
+
+def list_data_files(
+    data_dir, sync_status_dir=None, paths=None, include_patterns=None, exclude_patterns=None,
+    skip_archive_managed=False
+):
+    local_files = list_local_files(
+        data_dir,
+        paths=paths,
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+        ignored_rel_paths=_archive_metadata_rel_paths(data_dir, sync_status_dir),
+    )
+    if skip_archive_managed:
+        local_files = _filter_archive_managed_files(local_files, read_archive_paths(sync_status_dir))
+    return local_files
 
 
 def validate_local_file(local_path):
@@ -280,6 +330,9 @@ class S3:
         if prune_individuals and not archive:
             logger.info(ARCHIVE_PRUNE_REQUIRES_ARCHIVE_MSG)
             return 1
+        if archive and (include_patterns or exclude_patterns):
+            logger.info(ARCHIVE_FILTERS_UNSUPPORTED_MSG)
+            return 1
         if archive:
             return self.push_archive(data_dir, s3_path, paths, extra_flags, sync_status_dir, prune_individuals)
         markers = SyncMarkers(sync_status_dir)
@@ -288,18 +341,15 @@ class S3:
         archive_paths = read_archive_paths(sync_status_dir)
         if archive_paths:
             logger.info(f"push discovery: skipping archive-managed path(s): {', '.join(archive_paths)}")
-        local_files = list_local_files(
+        local_files = list_data_files(
             data_dir,
+            sync_status_dir=sync_status_dir,
             paths=paths,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
         )
         if archive_paths:
-            local_files = {
-                rel_path: local_path
-                for rel_path, local_path in local_files.items()
-                if not any(_is_under_archive_path(rel_path, archive_path) for archive_path in archive_paths)
-            }
+            local_files = _filter_archive_managed_files(local_files, archive_paths)
         started = time.monotonic()
         total = len(local_files)
         logger.info(f"push discovery: selected {total} file(s)")
@@ -401,7 +451,7 @@ class S3:
         archive_key = prefix + archive_rel
         manifest_key = prefix + manifest_rel
         archive_root = os.path.join(data_dir, *archive_root_rel.split('/'))
-        local_files = list_local_files(data_dir, paths=paths)
+        local_files = list_data_files(data_dir, sync_status_dir=sync_status_dir, paths=paths)
         logger.info(f"archive push: selected {len(local_files)} file(s) under {paths[0]}")
         issues = validate_local_files(local_files)
         if issues:
@@ -547,7 +597,7 @@ class S3:
                     failures += 1
                     logger.info(f"\n*** Error ***\n{e}\n")
         if delete:
-            local_files = list_local_files(data_dir)
+            local_files = list_data_files(data_dir, sync_status_dir=sync_status_dir, skip_archive_managed=True)
             remote_rel = set(remote_objects)
             archive_paths = read_archive_paths(sync_status_dir)
             for rel_path, local_path in sorted(local_files.items()):
@@ -615,11 +665,13 @@ class S3:
                 manifest_path = archive_path[:-len(ARCHIVE_EXT)] + ARCHIVE_MANIFEST_EXT
                 if not os.path.exists(manifest_path):
                     continue
+                manifest = self._read_archive_manifest(manifest_path)
+                if not self._is_datakit_archive_manifest(manifest):
+                    continue
                 if dryrun:
                     logger.info(f"extract archive: {archive_path} to {data_dir}")
                     continue
-                manifest = self._read_archive_manifest(manifest_path)
-                archive_root = manifest.get('root_path') if manifest else None
+                archive_root = manifest.get('root_path')
                 extract_failures = self._extract_archive(archive_path, data_dir, manifest_path)
                 failures += extract_failures
                 if extract_failures == 0 and archive_root:
@@ -639,11 +691,22 @@ class S3:
             return None
         return manifest.get('root_path')
 
+    def _is_datakit_archive_manifest(self, manifest):
+        return (
+            isinstance(manifest, dict) and
+            manifest.get('version') == 1 and
+            manifest.get('archive_type') == 'zip' and
+            isinstance(manifest.get('archive_path'), str) and
+            isinstance(manifest.get('archive_sha256'), str) and
+            isinstance(manifest.get('root_path'), str) and
+            isinstance(manifest.get('files'), list)
+        )
+
     def _extract_archive(self, archive_path, data_dir, manifest_path=None):
         logger.info(f"extract archive: {archive_path} to {data_dir}")
         try:
             if manifest_path:
-                self._validate_archive_against_manifest(archive_path, manifest_path)
+                self._validate_archive_against_manifest(archive_path, data_dir, manifest_path)
             with zipfile.ZipFile(archive_path) as archive:
                 data_root = os.path.abspath(data_dir)
                 for member in archive.namelist():
@@ -658,18 +721,51 @@ class S3:
             return 1
         return 0
 
-    def _validate_archive_against_manifest(self, archive_path, manifest_path):
+    def _validate_archive_against_manifest(self, archive_path, data_dir, manifest_path):
         manifest = self._read_archive_manifest(manifest_path)
-        if manifest is None:
+        if not self._is_datakit_archive_manifest(manifest):
             raise OSError(f"Could not read archive manifest: {manifest_path}")
-        expected_archive = manifest.get('archive_path')
-        if expected_archive and os.path.basename(expected_archive) != os.path.basename(archive_path):
-            raise OSError(
-                f"Archive path does not match manifest: {os.path.basename(archive_path)} != {expected_archive}"
-            )
-        expected_sha256 = manifest.get('archive_sha256')
-        if expected_sha256 and _sha256_file(archive_path) != expected_sha256:
+        expected_archive = _normalize_archive_manifest_path(manifest['archive_path'])
+        if expected_archive is None:
+            raise OSError(f"Archive manifest has an invalid archive path: {manifest_path}")
+        archive_rel = _normalize_rel_path(os.path.relpath(archive_path, data_dir))
+        if expected_archive != archive_rel:
+            raise OSError(f"Archive path does not match manifest: {archive_rel} != {expected_archive}")
+        root_path = _normalize_archive_manifest_path(manifest['root_path'])
+        if root_path is None:
+            raise OSError(f"Archive manifest has an invalid root path: {manifest_path}")
+        if expected_archive != root_path + ARCHIVE_EXT:
+            raise OSError(f"Archive root does not match manifest archive path: {root_path} != {expected_archive}")
+        manifest_rel = _normalize_rel_path(os.path.relpath(manifest_path, data_dir))
+        if manifest_rel != root_path + ARCHIVE_MANIFEST_EXT:
+            raise OSError(f"Manifest path does not match archive root: {manifest_rel} != {root_path}")
+        if _sha256_file(archive_path) != manifest['archive_sha256']:
             raise OSError(f"Archive checksum does not match manifest: {archive_path}")
+        manifest_files = []
+        manifest_sizes = {}
+        for item in manifest['files']:
+            if not isinstance(item, dict) or not isinstance(item.get('path'), str):
+                raise OSError(f"Archive manifest has an invalid file entry: {manifest_path}")
+            file_path = _normalize_archive_manifest_path(item['path'])
+            if file_path is None:
+                raise OSError(f"Archive manifest has an invalid file path: {manifest_path}")
+            if not _is_under_archive_path(file_path, root_path):
+                raise OSError(f"Archive manifest file is outside archive root: {file_path}")
+            manifest_files.append(file_path)
+            if 'size' in item:
+                manifest_sizes[file_path] = item['size']
+        with zipfile.ZipFile(archive_path) as archive:
+            zip_infos = [info for info in archive.infolist() if not info.is_dir()]
+        zip_paths = [_normalize_archive_manifest_path(info.filename) for info in zip_infos]
+        if any(path is None for path in zip_paths):
+            raise OSError(f"Archive member has an invalid path: {archive_path}")
+        if sorted(zip_paths) != sorted(manifest_files):
+            raise OSError(f"Archive members do not match manifest: {archive_path}")
+        for info in zip_infos:
+            rel_path = _normalize_archive_manifest_path(info.filename)
+            expected_size = manifest_sizes.get(rel_path)
+            if expected_size is not None and info.file_size != expected_size:
+                raise OSError(f"Archive member size does not match manifest: {rel_path}")
 
     def compare(self, data_dir, s3_path='', sync_status_dir=None):
         """Compare local data files against the bucket's live listing.
@@ -682,7 +778,7 @@ class S3:
         markers = SyncMarkers(sync_status_dir)
         client = self._client()
         prefix = self._normalize_prefix(s3_path)
-        local_files = list_local_files(data_dir)
+        local_files = list_data_files(data_dir, sync_status_dir=sync_status_dir, skip_archive_managed=True)
         remote_objects = self._list_s3_objects(client, prefix)
         changed_local, changed_s3, conflict, differ = [], [], [], []
         for rel_path in sorted(set(local_files) & set(remote_objects)):

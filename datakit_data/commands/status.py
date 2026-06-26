@@ -5,7 +5,7 @@ from datakit import CommandHelpers
 from datakit.utils import read_json, write_json
 
 from ..project_mixin import ProjectMixin
-from ..s3 import S3, list_local_files
+from ..s3 import S3, list_data_files
 from ..sync_markers import SyncMarkers
 
 class Status(ProjectMixin, CommandHelpers, Command):
@@ -75,7 +75,11 @@ class Status(ProjectMixin, CommandHelpers, Command):
         # Local-only staleness check against the recorded markers; no S3 round-trips.
         missing = []
         stale = []
-        for rel_path, local_path in list_local_files(data_dir).items():
+        for rel_path, local_path in list_data_files(
+            data_dir,
+            sync_status_dir=markers.sync_status_dir,
+            skip_archive_managed=True,
+        ).items():
             _, marker_mtime = markers.read(rel_path)
             if marker_mtime is None:
                 missing.append(rel_path)
