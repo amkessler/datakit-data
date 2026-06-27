@@ -428,6 +428,54 @@ def test_pull_downloads_when_etag_differs(mocker, tmpdir):
         assert f.read() == 'new-etag'
 
 
+def test_pull_skips_archive_sidecars_when_expanded_dir_exists(caplog, mocker, tmpdir):
+    """
+    Regular pull does not download archive sidecar objects when the expanded archive root exists.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'source/current.csv': S3ObjectInfo(etag='current-etag'),
+        'source/snapshot.manifest.json': S3ObjectInfo(etag='manifest-etag'),
+        'source/snapshot.zip': S3ObjectInfo(etag='zip-etag'),
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project')
+
+    assert result == 0
+    download_calls = {call.args[1] for call in mock_client.download_file.call_args_list}
+    assert download_calls == {'2017/fake-project/source/current.csv'}
+    assert 'skipped: s3://foo.org/2017/fake-project/source/snapshot.manifest.json' in caplog.text
+    assert 'skipped: s3://foo.org/2017/fake-project/source/snapshot.zip' in caplog.text
+
+
+def test_pull_force_downloads_archive_sidecars_when_expanded_dir_exists(mocker, tmpdir):
+    """
+    --force preserves the explicit request to download archive sidecar objects.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'source/snapshot.manifest.json': S3ObjectInfo(etag='manifest-etag'),
+        'source/snapshot.zip': S3ObjectInfo(etag='zip-etag'),
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project', extra_flags=['--force'])
+
+    assert result == 0
+    download_calls = {call.args[1] for call in mock_client.download_file.call_args_list}
+    assert download_calls == {
+        '2017/fake-project/source/snapshot.manifest.json',
+        '2017/fake-project/source/snapshot.zip',
+    }
+
+
 def test_pull_archive_downloads_and_extracts(mocker, tmpdir):
     """
     S3.pull archive mode downloads the manifest/archive pair and extracts the archive.

@@ -177,6 +177,34 @@ def _is_archive_managed_remote_path(rel_path, archive_path):
     )
 
 
+def _archive_sidecar_root(rel_path, archive_paths=None, remote_rel_paths=None):
+    rel_path = _normalize_archive_manifest_path(rel_path)
+    if rel_path is None:
+        return None
+    archive_paths = set(archive_paths or [])
+    remote_rel_paths = set(remote_rel_paths or [])
+    if rel_path.endswith(ARCHIVE_EXT):
+        root_path = rel_path[:-len(ARCHIVE_EXT)]
+        if root_path in archive_paths or root_path + ARCHIVE_MANIFEST_EXT in remote_rel_paths:
+            return root_path
+    if rel_path.endswith(ARCHIVE_MANIFEST_EXT):
+        root_path = rel_path[:-len(ARCHIVE_MANIFEST_EXT)]
+        if root_path in archive_paths or root_path + ARCHIVE_EXT in remote_rel_paths:
+            return root_path
+    return None
+
+
+def _archive_root_local_dir(data_dir, archive_root):
+    return os.path.join(data_dir, *archive_root.split('/'))
+
+
+def _should_skip_archive_sidecar_pull(data_dir, rel_path, archive_paths, remote_rel_paths):
+    archive_root = _archive_sidecar_root(rel_path, archive_paths, remote_rel_paths)
+    if archive_root is None:
+        return False
+    return os.path.isdir(_archive_root_local_dir(data_dir, archive_root))
+
+
 def _normalize_archive_manifest_path(path):
     if not isinstance(path, str):
         return None
@@ -674,11 +702,16 @@ class S3:
         client = self._client()
         failures = 0
         remote_objects = self._list_s3_objects(client, prefix)
+        remote_rel_paths = set(remote_objects)
+        archive_paths = read_archive_paths(sync_status_dir)
         for rel_path in sorted(remote_objects):
             key = prefix + rel_path
             remote_etag = remote_objects[rel_path].etag
             local_path = os.path.join(data_dir, rel_path)
             if not force:
+                if _should_skip_archive_sidecar_pull(data_dir, rel_path, archive_paths, remote_rel_paths):
+                    logger.info(f"skipped: s3://{self.bucket}/{key}")
+                    continue
                 marker_etag = markers.etag(rel_path)
                 if marker_etag is not None and marker_etag == remote_etag and os.path.exists(local_path):
                     logger.info(f"skipped: s3://{self.bucket}/{key}")
@@ -696,7 +729,6 @@ class S3:
         if delete:
             local_files = list_data_files(data_dir, sync_status_dir=sync_status_dir, skip_archive_managed=True)
             remote_rel = set(remote_objects)
-            archive_paths = read_archive_paths(sync_status_dir)
             for rel_path, local_path in sorted(local_files.items()):
                 if any(_is_under_archive_path(rel_path, archive_path) for archive_path in archive_paths):
                     continue
