@@ -177,29 +177,44 @@ def _is_archive_managed_remote_path(rel_path, archive_path):
     )
 
 
+def _archive_sidecar_candidate_root(rel_path, remote_rel_paths=None):
+    rel_path = _normalize_archive_manifest_path(rel_path)
+    if rel_path is None:
+        return None
+    remote_rel_paths = set(remote_rel_paths or [])
+    if rel_path.endswith(ARCHIVE_EXT):
+        root_path = rel_path[:-len(ARCHIVE_EXT)]
+        if root_path + ARCHIVE_MANIFEST_EXT in remote_rel_paths:
+            return root_path
+    if rel_path.endswith(ARCHIVE_MANIFEST_EXT):
+        root_path = rel_path[:-len(ARCHIVE_MANIFEST_EXT)]
+        if root_path + ARCHIVE_EXT in remote_rel_paths:
+            return root_path
+    return None
+
+
 def _archive_sidecar_root(rel_path, archive_paths=None, remote_rel_paths=None):
     rel_path = _normalize_archive_manifest_path(rel_path)
     if rel_path is None:
         return None
     archive_paths = set(archive_paths or [])
-    remote_rel_paths = set(remote_rel_paths or [])
     if rel_path.endswith(ARCHIVE_EXT):
         root_path = rel_path[:-len(ARCHIVE_EXT)]
-        if root_path in archive_paths or root_path + ARCHIVE_MANIFEST_EXT in remote_rel_paths:
+        if root_path in archive_paths:
             return root_path
     if rel_path.endswith(ARCHIVE_MANIFEST_EXT):
         root_path = rel_path[:-len(ARCHIVE_MANIFEST_EXT)]
-        if root_path in archive_paths or root_path + ARCHIVE_EXT in remote_rel_paths:
+        if root_path in archive_paths:
             return root_path
-    return None
+    return _archive_sidecar_candidate_root(rel_path, remote_rel_paths)
 
 
 def _archive_root_local_dir(data_dir, archive_root):
     return os.path.join(data_dir, *archive_root.split('/'))
 
 
-def _should_skip_archive_sidecar_pull(data_dir, rel_path, archive_paths, remote_rel_paths):
-    archive_root = _archive_sidecar_root(rel_path, archive_paths, remote_rel_paths)
+def _should_skip_archive_sidecar_pull(data_dir, rel_path, archive_roots):
+    archive_root = _archive_sidecar_root(rel_path, archive_roots)
     if archive_root is None:
         return False
     return os.path.isdir(_archive_root_local_dir(data_dir, archive_root))
@@ -704,12 +719,16 @@ class S3:
         remote_objects = self._list_s3_objects(client, prefix)
         remote_rel_paths = set(remote_objects)
         archive_paths = read_archive_paths(sync_status_dir)
+        expanded_archive_roots = self._expanded_archive_roots(client, prefix, data_dir, remote_rel_paths, archive_paths)
+        if expanded_archive_roots and not dryrun:
+            for archive_root in sorted(expanded_archive_roots - set(archive_paths)):
+                register_archive_path(sync_status_dir, archive_root)
         for rel_path in sorted(remote_objects):
             key = prefix + rel_path
             remote_etag = remote_objects[rel_path].etag
             local_path = os.path.join(data_dir, rel_path)
             if not force:
-                if _should_skip_archive_sidecar_pull(data_dir, rel_path, archive_paths, remote_rel_paths):
+                if _should_skip_archive_sidecar_pull(data_dir, rel_path, expanded_archive_roots):
                     logger.info(f"skipped: s3://{self.bucket}/{key}")
                     continue
                 marker_etag = markers.etag(rel_path)
@@ -740,6 +759,8 @@ class S3:
                         except OSError as e:
                             failures += 1
                             logger.info(f"\n*** Error ***\n{e}\n")
+            if not force:
+                failures += self._delete_local_archive_sidecars(data_dir, expanded_archive_roots, dryrun)
         if expand_archives:
             failures += self._expand_local_archives(data_dir, dryrun, sync_status_dir)
         return failures
@@ -806,6 +827,60 @@ class S3:
                 if extract_failures == 0 and archive_root:
                     register_archive_path(sync_status_dir, archive_root)
         return failures
+
+    def _expanded_archive_roots(self, client, prefix, data_dir, remote_rel_paths, archive_paths):
+        roots = {
+            archive_path for archive_path in _normalized_archive_paths(archive_paths)
+            if os.path.isdir(_archive_root_local_dir(data_dir, archive_path))
+        }
+        candidate_roots = {
+            root for root in (
+                _archive_sidecar_candidate_root(rel_path, remote_rel_paths)
+                for rel_path in remote_rel_paths
+            )
+            if root is not None and os.path.isdir(_archive_root_local_dir(data_dir, root))
+        }
+        for root in sorted(candidate_roots - roots):
+            manifest = self._read_remote_archive_manifest(client, prefix + root + ARCHIVE_MANIFEST_EXT)
+            if self._archive_manifest_matches_root(manifest, root):
+                roots.add(root)
+        return roots
+
+    def _delete_local_archive_sidecars(self, data_dir, archive_roots, dryrun=False):
+        failures = 0
+        for archive_root in sorted(archive_roots):
+            if not os.path.isdir(_archive_root_local_dir(data_dir, archive_root)):
+                continue
+            for rel_path in (archive_root + ARCHIVE_MANIFEST_EXT, archive_root + ARCHIVE_EXT):
+                local_path = os.path.join(data_dir, rel_path)
+                if not os.path.exists(local_path):
+                    continue
+                logger.info(f"delete: {local_path}")
+                if dryrun:
+                    continue
+                try:
+                    os.remove(local_path)
+                except OSError as e:
+                    failures += 1
+                    logger.info(f"\n*** Error ***\n{e}\n")
+        return failures
+
+    def _read_remote_archive_manifest(self, client, key):
+        try:
+            response = client.get_object(Bucket=self.bucket, Key=key)
+            body = response['Body'].read()
+            if isinstance(body, bytes):
+                body = body.decode('utf-8')
+            return json.loads(body)
+        except (ClientError, BotoCoreError, OSError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    def _archive_manifest_matches_root(self, manifest, root_path):
+        if not self._is_datakit_archive_manifest(manifest):
+            return False
+        manifest_root = _normalize_archive_manifest_path(manifest['root_path'])
+        manifest_archive = _normalize_archive_manifest_path(manifest['archive_path'])
+        return manifest_root == root_path and manifest_archive == root_path + ARCHIVE_EXT
 
     def _read_archive_manifest(self, manifest_path):
         try:
@@ -909,6 +984,13 @@ class S3:
         prefix = self._normalize_prefix(s3_path)
         local_files = list_data_files(data_dir, sync_status_dir=sync_status_dir, skip_archive_managed=True)
         remote_objects = self._list_s3_objects(client, prefix)
+        archive_paths = read_archive_paths(sync_status_dir)
+        expanded_archive_roots = self._expanded_archive_roots(client, prefix, data_dir, set(remote_objects), archive_paths)
+        local_files = _filter_archive_managed_files(local_files, expanded_archive_roots)
+        remote_objects = {
+            rel_path: obj for rel_path, obj in remote_objects.items()
+            if not _should_skip_archive_sidecar_pull(data_dir, rel_path, expanded_archive_roots)
+        }
         changed_local, changed_s3, conflict, differ = [], [], [], []
         for rel_path in sorted(set(local_files) & set(remote_objects)):
             marker_etag, marker_mtime = markers.read(rel_path)

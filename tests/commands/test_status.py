@@ -466,7 +466,7 @@ def test_status_excludes_archive_managed_paths(caplog, fake_project):
 
 def test_all_excludes_archive_managed_local_paths(caplog, mocker, fake_project):
     """
-    --all does not report expanded archive-managed files as local-only objects.
+    --all does not report expanded archive-managed files or their archive sidecars.
     """
     _make_file(os.path.join(fake_project, 'data', 'source', 'snapshot', 'a.txt'))
     metadata_path = os.path.join(fake_project, '.sync_status', 'datakit-data-archives.json')
@@ -482,9 +482,10 @@ def test_all_excludes_archive_managed_local_paths(caplog, mocker, fake_project):
     run_status(scan_all=True, filepaths=True)
 
     assert '0 file(s) local but not on S3' in caplog.text
+    assert '0 file(s) on S3 but not local' in caplog.text
     assert 'source/snapshot/a.txt' not in caplog.text
-    assert '  source/snapshot.zip' in caplog.text
-    assert '  source/snapshot.manifest.json' in caplog.text
+    assert 'source/snapshot.zip' not in caplog.text
+    assert 'source/snapshot.manifest.json' not in caplog.text
 
 
 def test_all_filepaths_local_only(caplog, mocker):

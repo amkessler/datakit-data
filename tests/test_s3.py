@@ -433,7 +433,11 @@ def test_pull_skips_archive_sidecars_when_expanded_dir_exists(caplog, mocker, tm
     Regular pull does not download archive sidecar objects when the expanded archive root exists.
     """
     data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
     os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
+    entries = {'source/snapshot/a.txt': 'alpha'}
+    archive_data = _archive_bytes(entries)
+    manifest = _archive_manifest(archive_data, entries)
     mocker.patch.object(S3, '_list_s3_objects', return_value={
         'source/current.csv': S3ObjectInfo(etag='current-etag'),
         'source/snapshot.manifest.json': S3ObjectInfo(etag='manifest-etag'),
@@ -441,20 +445,50 @@ def test_pull_skips_archive_sidecars_when_expanded_dir_exists(caplog, mocker, tm
     })
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
+    mock_client.get_object.return_value = {'Body': io.BytesIO(json.dumps(manifest).encode())}
 
     s3 = S3('ap', 'foo.org')
-    result = s3.pull(data_dir, '2017/fake-project')
+    result = s3.pull(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
 
     assert result == 0
     download_calls = {call.args[1] for call in mock_client.download_file.call_args_list}
     assert download_calls == {'2017/fake-project/source/current.csv'}
     assert 'skipped: s3://foo.org/2017/fake-project/source/snapshot.manifest.json' in caplog.text
     assert 'skipped: s3://foo.org/2017/fake-project/source/snapshot.zip' in caplog.text
+    assert read_archive_paths(sync_dir) == ['source/snapshot']
 
 
 def test_pull_force_downloads_archive_sidecars_when_expanded_dir_exists(mocker, tmpdir):
     """
     --force preserves the explicit request to download archive sidecar objects.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
+    entries = {'source/snapshot/a.txt': 'alpha'}
+    archive_data = _archive_bytes(entries)
+    manifest = _archive_manifest(archive_data, entries)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'source/snapshot.manifest.json': S3ObjectInfo(etag='manifest-etag'),
+        'source/snapshot.zip': S3ObjectInfo(etag='zip-etag'),
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_client.get_object.return_value = {'Body': io.BytesIO(json.dumps(manifest).encode())}
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project', extra_flags=['--force'])
+
+    assert result == 0
+    download_calls = {call.args[1] for call in mock_client.download_file.call_args_list}
+    assert download_calls == {
+        '2017/fake-project/source/snapshot.manifest.json',
+        '2017/fake-project/source/snapshot.zip',
+    }
+
+
+def test_pull_does_not_skip_archive_sidecars_for_non_datakit_manifest(mocker, tmpdir):
+    """
+    A zip/manifest pair is downloaded normally when the manifest is not a Datakit archive manifest.
     """
     data_dir = str(tmpdir.mkdir('data'))
     os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
@@ -464,9 +498,12 @@ def test_pull_force_downloads_archive_sidecars_when_expanded_dir_exists(mocker, 
     })
     mock_session = mocker.patch('datakit_data.s3.boto3.Session')
     mock_client = mock_session.return_value.client.return_value
+    mock_client.get_object.return_value = {
+        'Body': io.BytesIO(json.dumps({'description': 'not a datakit archive manifest'}).encode())
+    }
 
     s3 = S3('ap', 'foo.org')
-    result = s3.pull(data_dir, '2017/fake-project', extra_flags=['--force'])
+    result = s3.pull(data_dir, '2017/fake-project')
 
     assert result == 0
     download_calls = {call.args[1] for call in mock_client.download_file.call_args_list}
@@ -1442,9 +1479,41 @@ def test_pull_delete_preserves_archive_metadata_in_data(mocker, tmpdir):
     mock_remove.assert_called_once_with(normal_path)
 
 
+def test_pull_delete_removes_local_archive_sidecars_for_expanded_archives(mocker, tmpdir):
+    """
+    S3.pull --delete removes stale local zip/manifest sidecars when the expanded archive exists.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
+    archive_path = os.path.join(data_dir, 'source', 'snapshot.zip')
+    manifest_path = os.path.join(data_dir, 'source', 'snapshot.manifest.json')
+    open(archive_path, 'w').close()
+    open(manifest_path, 'w').close()
+    with open(os.path.join(sync_dir, 'datakit-data-archives.json'), 'w') as f:
+        json.dump({'version': 1, 'archive_paths': ['source/snapshot']}, f)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'source/snapshot.manifest.json': S3ObjectInfo(etag='manifest'),
+        'source/snapshot.zip': S3ObjectInfo(etag='zip'),
+    })
+    mocker.patch('datakit_data.s3.boto3.Session')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(
+        data_dir,
+        '2017/fake-project',
+        extra_flags=['--delete'],
+        sync_status_dir=sync_dir,
+    )
+
+    assert result == 0
+    assert not os.path.exists(archive_path)
+    assert not os.path.exists(manifest_path)
+
+
 def test_compare_excludes_archive_managed_local_paths(mocker, tmpdir):
     """
-    S3.compare ignores expanded archive-managed files on the local side.
+    S3.compare ignores expanded archive-managed files and their remote archive sidecars.
     """
     data_dir = str(tmpdir.mkdir('data'))
     sync_dir = str(tmpdir.mkdir('sync'))
@@ -1465,7 +1534,32 @@ def test_compare_excludes_archive_managed_local_paths(mocker, tmpdir):
     comparison = s3.compare(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
 
     assert 'source/snapshot/a.txt' not in comparison.only_local
-    assert comparison.only_s3 == ['source/snapshot.manifest.json', 'source/snapshot.zip']
+    assert comparison.only_s3 == []
+
+
+def test_compare_infers_expanded_archives_from_remote_manifest(mocker, tmpdir):
+    """
+    S3.compare can suppress archive sidecars even when local archive metadata is missing.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    os.makedirs(os.path.join(data_dir, 'source', 'snapshot'))
+    open(os.path.join(data_dir, 'source', 'snapshot', 'a.txt'), 'w').close()
+    entries = {'source/snapshot/a.txt': 'alpha'}
+    archive_data = _archive_bytes(entries)
+    manifest = _archive_manifest(archive_data, entries)
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'source/snapshot.zip': S3ObjectInfo(etag='zip'),
+        'source/snapshot.manifest.json': S3ObjectInfo(etag='manifest'),
+    })
+    mock_client = mocker.Mock()
+    mock_client.get_object.return_value = {'Body': io.BytesIO(json.dumps(manifest).encode())}
+    mocker.patch.object(S3, '_client', return_value=mock_client)
+
+    s3 = S3('ap', 'foo.org')
+    comparison = s3.compare(data_dir, '2017/fake-project')
+
+    assert comparison.only_local == []
+    assert comparison.only_s3 == []
 
 
 def test_pull_delete_error(caplog, mocker):
