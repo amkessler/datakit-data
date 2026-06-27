@@ -2,6 +2,18 @@
 History
 =======
 
+0.6.3 (2026-06-27)
+------------------
+
+* Archive mode can store large snapshots as zip archives with JSON manifests
+* Archive-managed paths are tracked locally so regular pushes, pulls, deletes, status, and S3
+  comparisons do not treat expanded archive contents as ordinary per-file data
+* Archive pulls validate manifests and checksums before extraction and refuse to overwrite existing
+  local files
+* `--prune-individuals` can convert a path from per-file S3 objects to archive mode after a
+  successful archive upload
+* Push and pull output now reports progress summaries and transferred, skipped, or deleted paths
+
 0.5.0 (2026-06-04)
 ------------------
 

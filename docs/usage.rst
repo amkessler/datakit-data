@@ -284,6 +284,12 @@ A regular pull treats archives as ordinary files and does not extract them::
 
   $ datakit data pull
 
+If the matching archive subtree has already been expanded locally, a regular pull skips the remote
+zip and manifest sidecars for that archive so they do not overwrite or clutter the expanded
+directory. `datakit data pull delete` preserves expanded archive-managed files. When stale local
+zip or manifest sidecars exist next to an expanded archive, `pull delete` removes those sidecars
+without removing the extracted files.
+
 To download and extract local archive files that have matching manifests::
 
   $ datakit data pull --expand-archives
@@ -293,12 +299,14 @@ To restore one archived snapshot directly from S3::
   $ datakit data pull --archive --path data/source/current_snapshot
 
 Archive extraction validates the archive against its manifest when a checksum is available and
-refuses to overwrite existing local files. Once a snapshot has been expanded, `datakit data pull
-delete` preserves files below archive-managed paths instead of pruning them just because the
-individual files are not present as separate S3 objects.
+refuses to overwrite existing local files. Successful archive extraction records the archive root as
+archive-managed, whether the extraction came from `datakit data pull --archive --path ...` or from
+`datakit data pull --expand-archives`.
 
-`datakit data status --all` reports archive zip and manifest objects as ordinary S3 objects unless
-you have expanded those archives locally.
+`datakit data status` and `datakit data status --all` omit expanded archive-managed files from
+normal per-file status checks. When an archive has been expanded locally, `status --all` also
+suppresses the matching remote zip and manifest sidecars. If an archive has not been expanded
+locally, `status --all` reports its zip and manifest objects as ordinary S3 objects.
 
 Archive mode is best for immutable snapshots where users usually restore the whole snapshot. If
 users need frequent access to individual files directly in S3, normal per-file push/pull remains the

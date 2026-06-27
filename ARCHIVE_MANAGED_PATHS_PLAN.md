@@ -1,4 +1,4 @@
-# Archive-Managed Paths Plan
+# Archive-Managed Paths Behavior
 
 ## Goal
 
@@ -31,6 +31,34 @@ and upload all of its individual files. That defeats the purpose of archive mode
    - Uploads `PATH.zip` and `PATH.manifest.json` first.
    - Deletes existing individual S3 objects below `PATH` only after the archive upload succeeds.
    - Leaves pruning opt-in because it is destructive.
+
+5. Plain `datakit data pull`
+   - Downloads archive zip and manifest sidecars as ordinary files when the archive has not been
+     expanded locally.
+   - Skips archive zip and manifest sidecars when the matching archive root already exists locally.
+   - Records inferred archive-managed paths when a valid remote Datakit archive manifest matches
+     an expanded local archive root.
+
+6. `datakit data pull --expand-archives`
+   - Extracts downloaded local archive files that have matching Datakit manifests.
+   - Validates archive path, root path, checksum, member list, member sizes, and extraction targets.
+   - Records successfully expanded archive roots as archive-managed.
+
+7. `datakit data pull --archive --path PATH`
+   - Downloads `PATH.manifest.json` and `PATH.zip`.
+   - Extracts the archive after validation.
+   - Records the manifest root, or `PATH` when the manifest root is unavailable, as archive-managed.
+
+8. `datakit data pull delete`
+   - Preserves extracted files below archive-managed paths.
+   - Removes stale local archive zip and manifest sidecars for expanded archives unless `--force`
+     is used.
+
+9. `datakit data status` and `datakit data status --all`
+   - Exclude expanded archive-managed local files from per-file status checks.
+   - Suppress matching remote archive sidecars when the archive is expanded locally.
+   - Continue to report archive zip and manifest objects as ordinary S3 objects when the archive has
+     not been expanded locally.
 
 ## Metadata Format
 
@@ -65,4 +93,8 @@ When no sync status location is configured, use:
 - Archive push still includes the archive-managed subtree contents.
 - Archive prune only deletes individual S3 objects after archive upload succeeds.
 - Archive prune preserves `PATH.zip` and `PATH.manifest.json`.
-- Tests cover metadata read/write and skip behavior.
+- Pull skips archive sidecars for expanded archives.
+- Pull delete preserves expanded archive contents and removes stale local sidecars.
+- Status and compare exclude expanded archive-managed local files and matching remote sidecars.
+- Tests cover metadata read/write, skip behavior, extraction validation, delete preservation, and
+  status/compare behavior.
