@@ -743,12 +743,10 @@ class S3:
             if not force:
                 if _should_skip_archive_sidecar_pull(data_dir, rel_path, expanded_archive_roots):
                     skipped += 1
-                    logger.info(f"skipped: s3://{self.bucket}/{key}")
                     continue
                 marker_etag = markers.etag(rel_path)
                 if marker_etag is not None and marker_etag == remote_etag and os.path.exists(local_path):
                     skipped += 1
-                    logger.info(f"skipped: s3://{self.bucket}/{key}")
                     continue
             logger.info(f"download: s3://{self.bucket}/{key} to {local_path}")
             if not dryrun:
