@@ -165,6 +165,33 @@ def test_push_verbose_logs_skipped_files(caplog, mocker, tmpdir):
     assert f'skipped: {data_file}' in caplog.text
 
 
+def test_push_summary_lists_uploaded_files_only(caplog, mocker, tmpdir):
+    """
+    S3.push prints a final list of uploaded files without listing skipped files.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    skipped_file = os.path.join(data_dir, 'skipped.csv')
+    uploaded_file = os.path.join(data_dir, 'uploaded.csv')
+    open(skipped_file, 'w').close()
+    open(uploaded_file, 'w').close()
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mocker.patch.object(S3, '_upload', return_value='etag')
+
+    SyncMarkers(sync_dir).write('skipped.csv', 'etag123')
+    now = time.time()
+    os.utime(skipped_file, (now - 100, now - 100))
+    os.utime(os.path.join(sync_dir, 'skipped.csv.synced'), (now, now))
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
+
+    assert result == 0
+    assert '1 uploaded file(s):' in caplog.text
+    assert '  uploaded.csv' in caplog.text
+    assert '  skipped.csv' not in caplog.text
+
+
 def test_push_force_uploads_even_when_marker_fresh(mocker, tmpdir):
     """
     S3.push with --force uploads a file even when its .synced marker is fresh, then
@@ -426,6 +453,38 @@ def test_pull_downloads_when_etag_differs(mocker, tmpdir):
                                                       os.path.join(data_dir, 'foo.csv'))
     with open(os.path.join(sync_dir, 'foo.csv.synced')) as f:
         assert f.read() == 'new-etag'
+
+
+def test_pull_summary_lists_downloaded_files_only(caplog, mocker, tmpdir):
+    """
+    S3.pull prints a final list of downloaded files without listing skipped files.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    sync_dir = str(tmpdir.mkdir('sync'))
+    skipped_file = os.path.join(data_dir, 'skipped.csv')
+    open(skipped_file, 'w').close()
+    mocker.patch.object(S3, '_list_s3_objects', return_value={
+        'downloaded.csv': S3ObjectInfo(etag='downloaded-etag'),
+        'skipped.csv': S3ObjectInfo(etag='same-etag'),
+    })
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    SyncMarkers(sync_dir).write('skipped.csv', 'same-etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
+
+    assert result == 0
+    mock_client.download_file.assert_called_once_with(
+        'foo.org',
+        '2017/fake-project/downloaded.csv',
+        os.path.join(data_dir, 'downloaded.csv'),
+    )
+    assert 'pull summary: downloaded=1 skipped=1 failed=0' in caplog.text
+    assert '1 downloaded file(s):' in caplog.text
+    assert '  downloaded.csv' in caplog.text
+    assert '  skipped.csv' not in caplog.text
 
 
 def test_pull_skips_archive_sidecars_when_expanded_dir_exists(caplog, mocker, tmpdir):

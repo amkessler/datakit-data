@@ -474,6 +474,7 @@ class S3:
         logger.info(f"push discovery: selected {total} file(s)")
         processed = 0
         uploaded = 0
+        uploaded_paths = []
         skipped = 0
         logger.info(f"push preflight: validating selected files with {jobs} worker(s)")
         preflight_issues = validate_local_files(
@@ -508,11 +509,13 @@ class S3:
                     try:
                         self._upload_and_mark(client, decision.rel_path, decision.local_path, decision.key, markers)
                         uploaded += 1
+                        uploaded_paths.append(decision.rel_path)
                     except (ClientError, BotoCoreError, OSError) as e:
                         failures += 1
                         logger.info(f"\n*** Error ***\n{e}\n")
                 else:
                     uploaded += 1
+                    uploaded_paths.append(decision.rel_path)
                 processed += 1
                 self._log_push_progress(processed, total, uploaded, skipped, failures, started)
         if upload_items:
@@ -529,6 +532,7 @@ class S3:
                         if markers.enabled:
                             markers.write(rel_path, etag)
                         uploaded += 1
+                        uploaded_paths.append(rel_path)
                     except (ClientError, BotoCoreError, OSError) as e:
                         failures += 1
                         logger.info(f"\n*** Error ***\n{e}\n")
@@ -549,6 +553,7 @@ class S3:
             if not dryrun:
                 failures += self._delete_keys(client, to_delete)
         self._log_push_summary(total, uploaded, skipped, failures, started)
+        self._log_file_list('would upload file(s)' if dryrun else 'uploaded file(s)', uploaded_paths)
         return failures
 
     def push_archive(
@@ -593,6 +598,7 @@ class S3:
                     f"archive prune: would delete individual objects below "
                     f"s3://{self.bucket}/{prefix + archive_root_rel}/ after successful upload"
                 )
+            self._log_file_list('would upload file(s)', [archive_rel, manifest_rel])
             return 0
         markers = SyncMarkers(sync_status_dir)
         client = self._client()
@@ -613,7 +619,10 @@ class S3:
                 return 1
         register_archive_path(sync_status_dir, archive_root_rel)
         if prune_individuals:
-            return self._prune_archive_individuals(client, prefix, archive_root_rel)
+            failures = self._prune_archive_individuals(client, prefix, archive_root_rel)
+            self._log_file_list('uploaded file(s)', [archive_rel, manifest_rel])
+            return failures
+        self._log_file_list('uploaded file(s)', [archive_rel, manifest_rel])
         return 0
 
     def _create_archive(self, data_dir, archive_root, local_files, archive_rel, archive_path):
@@ -716,6 +725,10 @@ class S3:
         markers = SyncMarkers(sync_status_dir)
         client = self._client()
         failures = 0
+        downloaded = 0
+        downloaded_paths = []
+        skipped = 0
+        started = time.monotonic()
         remote_objects = self._list_s3_objects(client, prefix)
         remote_rel_paths = set(remote_objects)
         archive_paths = read_archive_paths(sync_status_dir)
@@ -729,10 +742,12 @@ class S3:
             local_path = os.path.join(data_dir, rel_path)
             if not force:
                 if _should_skip_archive_sidecar_pull(data_dir, rel_path, expanded_archive_roots):
+                    skipped += 1
                     logger.info(f"skipped: s3://{self.bucket}/{key}")
                     continue
                 marker_etag = markers.etag(rel_path)
                 if marker_etag is not None and marker_etag == remote_etag and os.path.exists(local_path):
+                    skipped += 1
                     logger.info(f"skipped: s3://{self.bucket}/{key}")
                     continue
             logger.info(f"download: s3://{self.bucket}/{key} to {local_path}")
@@ -742,9 +757,14 @@ class S3:
                     client.download_file(self.bucket, key, local_path)
                     if markers.enabled:
                         markers.write(rel_path, remote_etag)
+                    downloaded += 1
+                    downloaded_paths.append(rel_path)
                 except (ClientError, BotoCoreError) as e:
                     failures += 1
                     logger.info(f"\n*** Error ***\n{e}\n")
+            else:
+                downloaded += 1
+                downloaded_paths.append(rel_path)
         if delete:
             local_files = list_data_files(data_dir, sync_status_dir=sync_status_dir, skip_archive_managed=True)
             remote_rel = set(remote_objects)
@@ -763,6 +783,8 @@ class S3:
                 failures += self._delete_local_archive_sidecars(data_dir, expanded_archive_roots, dryrun)
         if expand_archives:
             failures += self._expand_local_archives(data_dir, dryrun, sync_status_dir)
+        self._log_pull_summary(downloaded, skipped, failures, started)
+        self._log_file_list('would download file(s)' if dryrun else 'downloaded file(s)', downloaded_paths)
         return failures
 
     def pull_archive(self, data_dir, s3_path='', paths=None, extra_flags=None, sync_status_dir=None):
@@ -780,17 +802,20 @@ class S3:
         client = self._client()
         markers = SyncMarkers(sync_status_dir)
         failures = 0
+        downloaded_paths = []
         for rel_path in (manifest_rel, archive_rel):
             key = prefix + rel_path
             local_path = os.path.join(data_dir, rel_path)
             logger.info(f"download: s3://{self.bucket}/{key} to {local_path}")
             if dryrun:
+                downloaded_paths.append(rel_path)
                 continue
             os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
             try:
                 client.download_file(self.bucket, key, local_path)
                 if markers.enabled:
                     markers.write(rel_path, self._object_etag(client, key))
+                downloaded_paths.append(rel_path)
             except (ClientError, BotoCoreError, OSError) as e:
                 failures += 1
                 logger.info(f"\n*** Error ***\n{e}\n")
@@ -803,6 +828,7 @@ class S3:
                 register_archive_path(sync_status_dir, archive_root or _normalize_filter_path(data_dir, paths[0]))
         elif dryrun:
             logger.info(f"extract archive: {os.path.join(data_dir, archive_rel)} to {data_dir}")
+        self._log_file_list('would download file(s)' if dryrun else 'downloaded file(s)', downloaded_paths)
         return failures
 
     def _expand_local_archives(self, data_dir, dryrun=False, sync_status_dir=None):
@@ -1111,6 +1137,23 @@ class S3:
             f"push summary: selected={total} uploaded={uploaded} skipped={skipped} "
             f"failed={failures} elapsed={elapsed:.1f}s rate={rate:.1f} files/s"
         )
+
+    def _log_pull_summary(self, downloaded, skipped, failures, started):
+        total = downloaded + skipped + failures
+        elapsed = max(time.monotonic() - started, 0.001)
+        rate = total / elapsed
+        logger.info(
+            f"pull summary: downloaded={downloaded} skipped={skipped} "
+            f"failed={failures} elapsed={elapsed:.1f}s rate={rate:.1f} files/s"
+        )
+
+    def _log_file_list(self, label, rel_paths):
+        rel_paths = sorted(set(rel_paths))
+        if not rel_paths:
+            return
+        logger.info(f"{len(rel_paths)} {label}:")
+        for rel_path in rel_paths:
+            logger.info(f"  {rel_path}")
 
     def _delete_keys(self, client, keys, progress_label=None):
         # delete_objects removes up to 1000 keys per request; batch accordingly.
