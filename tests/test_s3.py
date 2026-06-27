@@ -513,6 +513,7 @@ def test_pull_skips_archive_sidecars_when_expanded_dir_exists(caplog, mocker, tm
     assert result == 0
     download_calls = {call.args[1] for call in mock_client.download_file.call_args_list}
     assert download_calls == {'2017/fake-project/source/current.csv'}
+    assert 'pull discovery: skipping expanded archive sidecar path(s): source/snapshot' in caplog.text
     assert 'pull summary: downloaded=1 skipped=2 failed=0' in caplog.text
     assert 'skipped: s3://foo.org/2017/fake-project/source/snapshot.manifest.json' not in caplog.text
     assert 'skipped: s3://foo.org/2017/fake-project/source/snapshot.zip' not in caplog.text

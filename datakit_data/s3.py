@@ -736,6 +736,11 @@ class S3:
         remote_rel_paths = set(remote_objects)
         archive_paths = read_archive_paths(sync_status_dir)
         expanded_archive_roots = self._expanded_archive_roots(client, prefix, data_dir, remote_rel_paths, archive_paths)
+        if expanded_archive_roots:
+            logger.info(
+                "pull discovery: skipping expanded archive sidecar path(s): "
+                f"{', '.join(sorted(expanded_archive_roots))}"
+            )
         if expanded_archive_roots and not dryrun:
             for archive_root in sorted(expanded_archive_roots - set(archive_paths)):
                 register_archive_path(sync_status_dir, archive_root)
