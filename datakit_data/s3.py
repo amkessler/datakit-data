@@ -543,15 +543,18 @@ class S3:
                 client = self._client()
             remote_keys = self._list_s3_keys(client, prefix)
             remote_rel = {k[len(prefix):] for k in remote_keys}
-            to_delete = [
-                prefix + rel_path
+            delete_rel_paths = [
+                rel_path
                 for rel_path in sorted(remote_rel - set(local_files.keys()))
                 if not any(_is_archive_managed_remote_path(rel_path, archive_path) for archive_path in archive_paths)
             ]
-            for key in to_delete:
-                logger.info(f"delete: s3://{self.bucket}/{key}")
+            to_delete = [prefix + rel_path for rel_path in delete_rel_paths]
+            delete_failures = 0
             if not dryrun:
-                failures += self._delete_keys(client, to_delete)
+                delete_failures = self._delete_keys(client, to_delete)
+                failures += delete_failures
+            if dryrun or delete_failures == 0:
+                self._log_file_list('would delete file(s)' if dryrun else 'deleted file(s)', delete_rel_paths)
         self._log_push_summary(total, uploaded, skipped, failures, started)
         self._log_file_list('would upload file(s)' if dryrun else 'uploaded file(s)', uploaded_paths)
         return failures
@@ -766,19 +769,27 @@ class S3:
         if delete:
             local_files = list_data_files(data_dir, sync_status_dir=sync_status_dir, skip_archive_managed=True)
             remote_rel = set(remote_objects)
+            deleted_paths = []
             for rel_path, local_path in sorted(local_files.items()):
                 if any(_is_under_archive_path(rel_path, archive_path) for archive_path in archive_paths):
                     continue
                 if rel_path not in remote_rel:
-                    logger.info(f"delete: {local_path}")
                     if not dryrun:
                         try:
                             os.remove(local_path)
+                            deleted_paths.append(rel_path)
                         except OSError as e:
                             failures += 1
                             logger.info(f"\n*** Error ***\n{e}\n")
+                    else:
+                        deleted_paths.append(rel_path)
             if not force:
-                failures += self._delete_local_archive_sidecars(data_dir, expanded_archive_roots, dryrun)
+                sidecar_failures, sidecar_deleted_paths = self._delete_local_archive_sidecars(
+                    data_dir, expanded_archive_roots, dryrun
+                )
+                failures += sidecar_failures
+                deleted_paths.extend(sidecar_deleted_paths)
+            self._log_file_list('would delete file(s)' if dryrun else 'deleted file(s)', deleted_paths)
         if expand_archives:
             failures += self._expand_local_archives(data_dir, dryrun, sync_status_dir)
         self._log_pull_summary(downloaded, skipped, failures, started)
@@ -872,6 +883,7 @@ class S3:
 
     def _delete_local_archive_sidecars(self, data_dir, archive_roots, dryrun=False):
         failures = 0
+        deleted_paths = []
         for archive_root in sorted(archive_roots):
             if not os.path.isdir(_archive_root_local_dir(data_dir, archive_root)):
                 continue
@@ -879,15 +891,16 @@ class S3:
                 local_path = os.path.join(data_dir, rel_path)
                 if not os.path.exists(local_path):
                     continue
-                logger.info(f"delete: {local_path}")
                 if dryrun:
+                    deleted_paths.append(rel_path)
                     continue
                 try:
                     os.remove(local_path)
+                    deleted_paths.append(rel_path)
                 except OSError as e:
                     failures += 1
                     logger.info(f"\n*** Error ***\n{e}\n")
-        return failures
+        return failures, deleted_paths
 
     def _read_remote_archive_manifest(self, client, key):
         try:

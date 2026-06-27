@@ -1382,7 +1382,7 @@ def test_pull_dryrun(mocker):
     mock_client.download_file.assert_not_called()
 
 
-def test_push_delete(mocker):
+def test_push_delete(caplog, mocker):
     """
     S3.push with --delete batch-removes S3 keys that have no corresponding local file.
     """
@@ -1405,6 +1405,30 @@ def test_push_delete(mocker):
         Bucket='foo.org',
         Delete={'Objects': [{'Key': '2017/fake-project/stale'}]},
     )
+    assert '1 deleted file(s):' in caplog.text
+    assert '  stale' in caplog.text
+
+
+def test_push_delete_dryrun_lists_files_that_would_be_deleted(caplog, mocker):
+    """
+    S3.push --delete --dryrun reports the S3 keys that would be removed.
+    """
+    mocker.patch('datakit_data.s3.list_local_files', return_value={'foo': 'data/foo'})
+    mocker.patch.object(S3, '_list_s3_keys', return_value=[
+        '2017/fake-project/foo',
+        '2017/fake-project/stale',
+    ])
+    mocker.patch.object(S3, '_upload', return_value='etag')
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push('data/', '2017/fake-project', extra_flags=['--delete', '--dryrun'])
+
+    assert result == 0
+    mock_client.delete_objects.assert_not_called()
+    assert '1 would delete file(s):' in caplog.text
+    assert '  stale' in caplog.text
 
 
 def test_push_delete_preserves_archive_managed_remote_paths(mocker, tmpdir):
@@ -1442,7 +1466,7 @@ def test_push_delete_preserves_archive_managed_remote_paths(mocker, tmpdir):
     )
 
 
-def test_pull_delete(mocker):
+def test_pull_delete(caplog, mocker):
     """
     S3.pull with --delete removes local files that are absent from S3.
     """
@@ -1460,6 +1484,29 @@ def test_pull_delete(mocker):
 
     assert result == 0
     mock_remove.assert_called_once_with('data/stale')
+    assert '1 deleted file(s):' in caplog.text
+    assert '  stale' in caplog.text
+
+
+def test_pull_delete_dryrun_lists_files_that_would_be_deleted(caplog, mocker):
+    """
+    S3.pull --delete --dryrun reports the local files that would be removed.
+    """
+    mocker.patch.object(S3, '_list_s3_objects', return_value={'foo': S3ObjectInfo(etag='e1')})
+    mocker.patch('datakit_data.s3.list_local_files', return_value={
+        'foo': 'data/foo',
+        'stale': 'data/stale',
+    })
+    mocker.patch('datakit_data.s3.boto3.Session')
+    mock_remove = mocker.patch('datakit_data.s3.os.remove')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull('data/', '2017/fake-project', extra_flags=['--delete', '--dryrun'])
+
+    assert result == 0
+    mock_remove.assert_not_called()
+    assert '1 would delete file(s):' in caplog.text
+    assert '  stale' in caplog.text
 
 
 def test_pull_delete_preserves_sync_markers(mocker, tmpdir):
