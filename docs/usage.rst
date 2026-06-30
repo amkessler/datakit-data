@@ -235,6 +235,10 @@ To further restrict candidates by relative path globs::
 For safety, filtered pushes cannot be combined with `delete`; run an unfiltered delete separately if
 you intend to prune the entire configured S3 path.
 
+Datakit ignores macOS Finder `.DS_Store` metadata files during push, pull, status, and S3 comparison
+operations. Remote `.DS_Store` objects are still eligible for removal during an unfiltered
+`datakit data push delete`.
+
 By default, real `push` runs report progress and summary counters instead of logging every skipped
 or uploaded file. Dry runs still print planned uploads. Use `--verbose` to restore per-file skipped
 and uploaded output during real pushes::

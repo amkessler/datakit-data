@@ -57,6 +57,7 @@ ARCHIVE_FILTERS_UNSUPPORTED_MSG = "\n*** Archive mode does not support --include
 ARCHIVE_EXT = '.zip'
 ARCHIVE_MANIFEST_EXT = '.manifest.json'
 ARCHIVE_METADATA_FILENAME = 'datakit-data-archives.json'
+IGNORED_SYSTEM_FILENAMES = {'.DS_Store'}
 
 
 def _normalize_rel_path(path):
@@ -87,6 +88,10 @@ def _normalize_filter_path(data_dir, path):
 
 def _matches_any(rel_path, patterns):
     return any(fnmatch.fnmatchcase(rel_path, pattern) for pattern in patterns)
+
+
+def _is_ignored_system_file(rel_path):
+    return rel_path.rsplit('/', 1)[-1] in IGNORED_SYSTEM_FILENAMES
 
 
 def _selected_by_patterns(rel_path, include_patterns, exclude_patterns):
@@ -297,6 +302,8 @@ def list_local_files(
                     continue
                 full_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(full_path, data_dir).replace(os.sep, '/')
+                if _is_ignored_system_file(rel_path):
+                    continue
                 if rel_path in ignored_rel_paths:
                     continue
                 if not _selected_by_patterns(rel_path, include_patterns, exclude_patterns):
@@ -1226,6 +1233,6 @@ class S3:
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get('Contents', []):
                 rel_path = obj['Key'][len(prefix):]
-                if not self._is_directory_marker(obj['Key'], prefix):
+                if not self._is_directory_marker(obj['Key'], prefix) and not _is_ignored_system_file(rel_path):
                     objects[rel_path] = S3ObjectInfo(etag=self._normalize_etag(obj.get('ETag')))
         return objects

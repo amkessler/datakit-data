@@ -187,6 +187,17 @@ def test_synced_placeholder_files_ignored(caplog, fake_project):
     assert '0 file(s) missing a .synced file' in caplog.text
 
 
+def test_ds_store_files_ignored(caplog, fake_project):
+    """
+    macOS Finder metadata files are excluded from status counts.
+    """
+    _make_file(os.path.join(fake_project, 'data', '.DS_Store'))
+    _make_file(os.path.join(fake_project, 'data', 'source', '.DS_Store'))
+    run_status(filepaths=True)
+    assert '0 file(s) missing a .synced file' in caplog.text
+    assert '.DS_Store' not in caplog.text
+
+
 def test_nested_files(caplog, fake_project):
     """
     Status correctly matches .synced markers in subdirectories to nested data files.

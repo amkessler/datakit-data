@@ -92,6 +92,31 @@ def test_pull(mocker):
     assert ('foo.org', '2017/fake-project/bar', 'data/bar') in download_calls
 
 
+def test_pull_ignores_remote_ds_store(mocker, tmpdir):
+    """
+    S3.pull ignores macOS Finder metadata files from the remote listing.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_paginator = mock_client.get_paginator.return_value
+    mock_paginator.paginate.return_value = [{'Contents': [
+        {'Key': '2017/fake-project/foo.csv', 'ETag': '"foo-etag"'},
+        {'Key': '2017/fake-project/.DS_Store', 'ETag': '"root-ds-etag"'},
+        {'Key': '2017/fake-project/source/.DS_Store', 'ETag': '"nested-ds-etag"'},
+    ]}]
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.pull(data_dir, '2017/fake-project')
+
+    assert result == 0
+    mock_client.download_file.assert_called_once_with(
+        'foo.org',
+        '2017/fake-project/foo.csv',
+        os.path.join(data_dir, 'foo.csv'),
+    )
+
+
 def test_push_creates_sync_markers(mocker, tmpdir):
     """S3.push records the uploaded object's ETag (quotes stripped) in the .synced marker.
 
@@ -930,6 +955,26 @@ def test_push_include_and_exclude_patterns(mocker, tmpdir):
     assert upload_keys == {'2017/fake-project/source/keep.csv'}
 
 
+def test_push_ignores_ds_store_files(mocker, tmpdir):
+    """
+    S3.push does not upload macOS Finder metadata files.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    os.makedirs(os.path.join(data_dir, 'source'))
+    open(os.path.join(data_dir, 'foo.csv'), 'w').close()
+    open(os.path.join(data_dir, '.DS_Store'), 'w').close()
+    open(os.path.join(data_dir, 'source', '.DS_Store'), 'w').close()
+    mocker.patch('datakit_data.s3.boto3.Session')
+    upload = mocker.patch.object(S3, '_upload', return_value='etag')
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project')
+
+    assert result == 0
+    upload_keys = {call.args[2] for call in upload.call_args_list}
+    assert upload_keys == {'2017/fake-project/foo.csv'}
+
+
 def test_push_parallel_uploads_use_worker_clients(caplog, mocker, tmpdir):
     """
     S3.push creates worker-local boto3 clients when parallel uploads are requested.
@@ -1467,6 +1512,33 @@ def test_push_delete_preserves_archive_managed_remote_paths(mocker, tmpdir):
     )
 
 
+def test_push_delete_removes_remote_ds_store_even_when_local_exists(mocker, tmpdir):
+    """
+    S3.push --delete can clean up remote .DS_Store objects because local .DS_Store files are
+    ignored as data.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    open(os.path.join(data_dir, 'foo.csv'), 'w').close()
+    open(os.path.join(data_dir, '.DS_Store'), 'w').close()
+    mocker.patch.object(S3, '_list_s3_keys', return_value=[
+        '2017/fake-project/foo.csv',
+        '2017/fake-project/.DS_Store',
+    ])
+    mocker.patch.object(S3, '_upload', return_value='etag')
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_client.delete_objects.return_value = {'Deleted': [{'Key': '2017/fake-project/.DS_Store'}]}
+
+    s3 = S3('ap', 'foo.org')
+    result = s3.push(data_dir, '2017/fake-project', extra_flags=['--delete'])
+
+    assert result == 0
+    mock_client.delete_objects.assert_called_once_with(
+        Bucket='foo.org',
+        Delete={'Objects': [{'Key': '2017/fake-project/.DS_Store'}]},
+    )
+
+
 def test_pull_delete(caplog, mocker):
     """
     S3.pull with --delete removes local files that are absent from S3.
@@ -1643,6 +1715,27 @@ def test_compare_excludes_archive_managed_local_paths(mocker, tmpdir):
     comparison = s3.compare(data_dir, '2017/fake-project', sync_status_dir=sync_dir)
 
     assert 'source/snapshot/a.txt' not in comparison.only_local
+    assert comparison.only_s3 == []
+
+
+def test_compare_ignores_ds_store_on_both_sides(mocker, tmpdir):
+    """
+    S3.compare ignores .DS_Store files locally and remotely.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    open(os.path.join(data_dir, '.DS_Store'), 'w').close()
+    mock_client = mocker.Mock()
+    mock_paginator = mock_client.get_paginator.return_value
+    mock_paginator.paginate.return_value = [{'Contents': [
+        {'Key': '2017/fake-project/.DS_Store', 'ETag': '"root-ds-etag"'},
+        {'Key': '2017/fake-project/source/.DS_Store', 'ETag': '"nested-ds-etag"'},
+    ]}]
+    mocker.patch.object(S3, '_client', return_value=mock_client)
+
+    s3 = S3('ap', 'foo.org')
+    comparison = s3.compare(data_dir, '2017/fake-project')
+
+    assert comparison.only_local == []
     assert comparison.only_s3 == []
 
 
@@ -2016,6 +2109,21 @@ def test_list_local_files(tmpdir):
     assert result['foo'] == os.path.join(data_dir, 'foo')
 
 
+def test_list_local_files_ignores_ds_store(tmpdir):
+    """
+    list_local_files excludes macOS Finder metadata files at any depth.
+    """
+    data_dir = str(tmpdir.mkdir('data'))
+    os.makedirs(os.path.join(data_dir, 'source'))
+    open(os.path.join(data_dir, 'foo.csv'), 'w').close()
+    open(os.path.join(data_dir, '.DS_Store'), 'w').close()
+    open(os.path.join(data_dir, 'source', '.DS_Store'), 'w').close()
+
+    result = list_local_files(data_dir)
+
+    assert result == {'foo.csv': os.path.join(data_dir, 'foo.csv')}
+
+
 def test_list_data_files_excludes_archive_metadata_in_data(tmpdir):
     """
     Internal archive metadata is not treated as data when sync status lives in data/.
@@ -2204,6 +2312,23 @@ def test_list_s3_objects_ignores_directory_markers(mocker):
     mock_paginator.paginate.return_value = [{'Contents': [
         {'Key': '2017/', 'ETag': '"root"'},
         {'Key': '2017/subdir/', 'ETag': '"directory"'},
+        {'Key': '2017/subdir/foo.csv', 'ETag': '"aaa"'},
+    ]}]
+
+    s3 = S3('ap', 'foo.org')
+    client = s3._client()
+    result = s3._list_s3_objects(client, '2017/')
+
+    assert result == {'subdir/foo.csv': S3ObjectInfo(etag='aaa')}
+
+
+def test_list_s3_objects_ignores_ds_store(mocker):
+    mock_session = mocker.patch('datakit_data.s3.boto3.Session')
+    mock_client = mock_session.return_value.client.return_value
+    mock_paginator = mock_client.get_paginator.return_value
+    mock_paginator.paginate.return_value = [{'Contents': [
+        {'Key': '2017/.DS_Store', 'ETag': '"root"'},
+        {'Key': '2017/subdir/.DS_Store', 'ETag': '"nested"'},
         {'Key': '2017/subdir/foo.csv', 'ETag': '"aaa"'},
     ]}]
 
